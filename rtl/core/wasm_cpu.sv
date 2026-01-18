@@ -110,10 +110,14 @@ module wasm_cpu
 
     // Branch stack unwind state
     logic [15:0] branch_target_stack_height;  // Stack height to restore to
-    logic [7:0]  branch_target_arity;         // Number of result values to keep
+    logic [7:0]  branch_target_arity;         // Number of result values to keep (0xFE=save phase, 0xFF=restore phase)
     logic [31:0] branch_target_pc;            // Saved target PC (for func return check)
-    stack_entry_t branch_saved_value;         // Saved result value (for arity=1)
+    stack_entry_t branch_saved_value;         // Saved result value (for arity=1, kept for compatibility)
     logic        branch_pop_pending;          // Pop from br_if that hasn't taken effect yet
+    // Multi-value branch support
+    stack_entry_t branch_saved_values [0:15]; // Saved result values for multi-value branches
+    logic [7:0]  branch_mv_idx;               // Current index during save/restore
+    logic [7:0]  branch_mv_arity;             // Actual arity (stored while phases use branch_target_arity)
 
     // Call state - for copying arguments to locals
     logic [15:0] call_func_idx;       // Index of function being called
@@ -250,6 +254,12 @@ module wasm_cpu
             // Capture results: peek at stack starting from TOS (offset 0)
             // capture_result_idx is the current index being captured
             stack_peek_offset = {8'b0, capture_result_idx};
+            stack_peek_offset2 = 16'd0;
+        end else if (state == STATE_BR_UNWIND && branch_target_arity == 8'hFE) begin
+            // Multi-value branch save phase: peek at values from TOS down
+            // If pop_pending (from br_if), the condition is at TOS so skip it (add 1)
+            // branch_mv_idx=0 -> TOS (offset 0 or 1), branch_mv_idx=1 -> TOS-1 (offset 1 or 2), etc.
+            stack_peek_offset = branch_pop_pending ? ({8'b0, branch_mv_idx} + 16'd1) : {8'b0, branch_mv_idx};
             stack_peek_offset2 = 16'd0;
         end else begin
             stack_peek_offset = 16'd1;   // TOS-1
@@ -689,6 +699,8 @@ module wasm_cpu
             branch_target_pc <= 32'h0;
             branch_saved_value <= '0;
             branch_pop_pending <= 1'b0;
+            branch_mv_idx <= 8'h0;
+            branch_mv_arity <= 8'h0;
         end else begin
             // Default assignments
             stack_push_en <= 1'b0;
@@ -2161,7 +2173,13 @@ module wasm_cpu
                                 label_push_en <= 1'b1;
                                 label_push_data.target_pc <= 32'h0;
                                 label_push_data.stack_height <= stack_ptr;
-                                label_push_data.arity <= (saved_decoded.immediate == 64'hFFFFFFFF) ? 8'h0 : 8'h1;
+                                // Determine block arity from block type (same logic as OP_IF)
+                                if (saved_decoded.immediate == 64'hFFFFFFFF)
+                                    label_push_data.arity <= 8'h0;
+                                else if (saved_decoded.immediate >= 64'h7C && saved_decoded.immediate <= 64'h7F)
+                                    label_push_data.arity <= 8'h1;
+                                else
+                                    label_push_data.arity <= type_table[saved_decoded.immediate[7:0]].result_count;
                                 label_push_data.is_loop <= 1'b0;
                                 pc <= pc + 1;
                                 state <= STATE_FETCH;
@@ -2377,61 +2395,102 @@ module wasm_cpu
                 STATE_BR_UNWIND: begin
                     // Unwind stack after branch to match target label's stack height
                     // For arity > 0, we need to keep the top arity values
+                    // Uses phases: normal (compute), 0xFE (multi-value save), 0xFF (restore)
                     logic need_collapse;
                     logic [15:0] excess_values;
                     logic is_func_return;
                     logic [15:0] effective_sp;
-                    logic pop_was_pending;
 
                     // Check if this is a branch to function block (return)
-                    // Use saved branch_target_pc since label stack has already been popped
                     is_func_return = (branch_target_pc == 32'hFFFFFFFF);
 
-                    // Adjust stack_ptr for pending pop from br_if (hasn't taken effect yet on first cycle)
+                    // Adjust stack_ptr for pending pop from br_if
                     effective_sp = branch_pop_pending ? (stack_ptr - 1) : stack_ptr;
                     excess_values = effective_sp - branch_target_stack_height;
-                    need_collapse = (branch_target_arity > 0) && (excess_values > {8'b0, branch_target_arity});
+                    need_collapse = (branch_target_arity > 0) && (branch_target_arity < 8'hFD) &&
+                                    (excess_values > {8'b0, branch_target_arity});
 
-                    // Save whether pop is pending before we clear it
-                    pop_was_pending = branch_pop_pending;
+                    if (branch_target_arity == 8'hFD) begin
+                        // First cycle of save phase: just transition, peek offset now correct
+                        // On next cycle, branch_target_arity will be 0xFE and peek works
+                        branch_target_arity <= 8'hFE;
+                    end else if (branch_target_arity == 8'hFE) begin
+                        // Multi-value save phase: save values one by one
+                        // peek_offset is set combinationally based on branch_mv_idx + pop_pending offset
+                        branch_saved_values[branch_mv_idx] <= stack_peek_data;
 
-                    // Clear the pending flag after first use
-                    branch_pop_pending <= 1'b0;
-
-                    if (need_collapse) begin
-                        // Phase 1: Save TOS, collapse stack to target height
-                        // Only read from stack if pop wasn't pending - otherwise value is already saved
-                        if (!pop_was_pending) begin
-                            branch_saved_value <= stack_pop_data;
-                        end
-                        // When pop was pending, branch_saved_value was already set correctly by br_if
-                        stack_set_sp_en <= 1'b1;
-                        stack_set_sp_value <= branch_target_stack_height;
-                        branch_target_arity <= 8'hFF;  // Flag for phase 2
-                    end else if (branch_target_arity == 8'hFF) begin
-                        // Phase 2: Push the saved value back
-                        branch_target_arity <= 8'h0;
-                        if (is_func_return) begin
-                            // Function return via br - set result directly (no stack push needed)
-                            // The value is already saved in branch_saved_value
-                            result_values[0] <= branch_saved_value;
-                            result_value <= branch_saved_value;
-                            result_valid <= 1'b1;
-                            result_count <= 8'h1;
-                            halted <= 1'b1;
-                            state <= STATE_HALT;
+                        if (branch_mv_idx + 8'd1 >= branch_mv_arity) begin
+                            // All values saved, collapse stack and enter restore phase
+                            branch_pop_pending <= 1'b0;
+                            stack_set_sp_en <= 1'b1;
+                            stack_set_sp_value <= branch_target_stack_height;
+                            branch_target_arity <= 8'hFF;  // Enter restore phase
+                            branch_mv_idx <= 8'h0;
                         end else begin
-                            // Non-return branch - push value back to stack
-                            stack_push_en <= 1'b1;
-                            stack_push_data <= branch_saved_value;
-                            state <= STATE_FETCH;
+                            branch_mv_idx <= branch_mv_idx + 8'd1;
+                        end
+                    end else if (branch_target_arity == 8'hFF) begin
+                        // Restore phase: push saved values back (or copy to results for function return)
+                        if (is_func_return) begin
+                            // Function return - copy saved values to result_values
+                            // branch_saved_values[0] = TOS, [1] = TOS-1, etc.
+                            // result_values[0] = bottom result, [N-1] = top result
+                            // So result_values[i] = branch_saved_values[arity-1-i]
+                            if (branch_mv_idx < branch_mv_arity) begin
+                                result_values[branch_mv_arity - 8'd1 - branch_mv_idx] <= branch_saved_values[branch_mv_idx];
+                                branch_mv_idx <= branch_mv_idx + 8'd1;
+                            end else begin
+                                // All results copied
+                                result_value <= result_values[0];
+                                result_valid <= 1'b1;
+                                result_count <= branch_mv_arity;
+                                halted <= 1'b1;
+                                branch_target_arity <= 8'h0;
+                                state <= STATE_HALT;
+                            end
+                        end else begin
+                            // Non-return branch - push values back to stack
+                            // Push in reverse order: branch_saved_values[arity-1] first, [0] last
+                            if (branch_mv_idx < branch_mv_arity) begin
+                                stack_push_en <= 1'b1;
+                                stack_push_data <= branch_saved_values[branch_mv_arity - 8'd1 - branch_mv_idx];
+                                branch_mv_idx <= branch_mv_idx + 8'd1;
+                            end else begin
+                                // All values pushed back
+                                branch_target_arity <= 8'h0;
+                                state <= STATE_FETCH;
+                            end
+                        end
+                    end else if (need_collapse) begin
+                        // Need to collapse stack - check if multi-value or single-value
+                        if (branch_target_arity > 8'd1) begin
+                            // Multi-value: enter save phase (0xFD is setup, 0xFE is active saving)
+                            branch_mv_arity <= branch_target_arity;
+                            branch_mv_idx <= 8'h0;
+                            branch_target_arity <= 8'hFD;  // Enter save phase setup
+                            // Don't clear pop_pending yet - needed for peek offset calculation
+                        end else begin
+                            // Single value (arity == 1): use original fast path
+                            if (!branch_pop_pending) begin
+                                branch_saved_value <= stack_pop_data;
+                                branch_saved_values[0] <= stack_pop_data;
+                            end else begin
+                                // Value already saved in branch_saved_value by br_if
+                                branch_saved_values[0] <= branch_saved_value;
+                            end
+                            branch_pop_pending <= 1'b0;
+                            stack_set_sp_en <= 1'b1;
+                            stack_set_sp_value <= branch_target_stack_height;
+                            branch_target_arity <= 8'hFF;  // Flag for phase 2
+                            branch_mv_arity <= 8'd1;  // Mark as single-value restore
+                            branch_mv_idx <= 8'h0;    // Initialize index for restore phase
                         end
                     end else if (branch_target_arity == 0 && effective_sp > branch_target_stack_height) begin
                         // Void block with extra values - restore stack height
+                        branch_pop_pending <= 1'b0;
                         stack_set_sp_en <= 1'b1;
                         stack_set_sp_value <= branch_target_stack_height;
                         if (is_func_return) begin
-                            // Function return via br (void) - no results to capture
                             capture_result_count <= 8'h0;
                             capture_result_idx <= 8'h0;
                             state <= STATE_CAPTURE_RESULTS;
@@ -2440,8 +2499,8 @@ module wasm_cpu
                         end
                     end else begin
                         // Stack already correct or arity matches excess
+                        branch_pop_pending <= 1'b0;
                         if (is_func_return) begin
-                            // Function return via br - capture results then halt
                             capture_result_count <= branch_target_arity;
                             capture_result_idx <= 8'h0;
                             state <= STATE_CAPTURE_RESULTS;
