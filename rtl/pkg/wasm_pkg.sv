@@ -302,7 +302,7 @@ package wasm_pkg;
     } fpu_op_t;
 
     // =========================================================================
-    // Memory Operation Types
+    // Memory Operation Types (WASM-specific, includes sign extension info)
     // =========================================================================
     typedef enum logic [3:0] {
         MEM_LOAD_I32,
@@ -321,6 +321,90 @@ package wasm_pkg;
         MEM_STORE_I16,
         MEM_STORE_I32_FROM_I64
     } mem_op_t;
+
+    // =========================================================================
+    // Memory Bus Interface (clean interface for external memory/AXI)
+    // =========================================================================
+
+    // Memory access size (power of 2 bytes)
+    typedef enum logic [1:0] {
+        MEM_SIZE_1 = 2'b00,  // 1 byte
+        MEM_SIZE_2 = 2'b01,  // 2 bytes
+        MEM_SIZE_4 = 2'b10,  // 4 bytes
+        MEM_SIZE_8 = 2'b11   // 8 bytes
+    } mem_size_t;
+
+    // Memory bus request (master -> slave)
+    // Simple valid/ready handshake, compatible with AXI-lite conversion
+    typedef struct packed {
+        logic        valid;      // Request valid
+        logic        write;      // 0 = read, 1 = write
+        logic [31:0] addr;       // Byte address
+        mem_size_t   size;       // Access size (1/2/4/8 bytes)
+        logic [63:0] wdata;      // Write data (little-endian, right-aligned)
+    } mem_bus_req_t;
+
+    // Memory bus response (slave -> master)
+    typedef struct packed {
+        logic        ready;      // Can accept request this cycle
+        logic        rvalid;     // Read response valid
+        logic [63:0] rdata;      // Read data (little-endian, zero-extended)
+        logic        error;      // Access error (out of bounds, etc.)
+    } mem_bus_resp_t;
+
+    // Memory management request (WASM-specific, separate from data path)
+    typedef struct packed {
+        logic        init_valid;       // Pulse to initialize memory
+        logic [31:0] init_pages;       // Initial page count
+        logic [31:0] init_max_pages;   // Maximum pages (0 = use default)
+        logic        grow_valid;       // Request to grow memory
+        logic [31:0] grow_pages;       // Number of pages to add
+    } mem_mgmt_req_t;
+
+    // Memory management response
+    typedef struct packed {
+        logic [31:0] current_pages;    // Current page count
+        logic [31:0] grow_result;      // Previous size or -1 on failure
+        logic        grow_done;        // Grow operation complete
+    } mem_mgmt_resp_t;
+
+    // Helper function: Convert mem_op_t to mem_size_t
+    function automatic mem_size_t mem_op_to_size(mem_op_t op);
+        case (op)
+            MEM_LOAD_I8_S, MEM_LOAD_I8_U, MEM_STORE_I8:
+                return MEM_SIZE_1;
+            MEM_LOAD_I16_S, MEM_LOAD_I16_U, MEM_STORE_I16:
+                return MEM_SIZE_2;
+            MEM_LOAD_I32, MEM_LOAD_F32, MEM_LOAD_I32_S, MEM_LOAD_I32_U,
+            MEM_STORE_I32, MEM_STORE_I32_FROM_I64:
+                return MEM_SIZE_4;
+            MEM_LOAD_I64, MEM_LOAD_F64, MEM_STORE_I64:
+                return MEM_SIZE_8;
+            default:
+                return MEM_SIZE_4;
+        endcase
+    endfunction
+
+    // Helper function: Check if mem_op_t is a write operation
+    function automatic logic mem_op_is_write(mem_op_t op);
+        case (op)
+            MEM_STORE_I32, MEM_STORE_I64, MEM_STORE_I8,
+            MEM_STORE_I16, MEM_STORE_I32_FROM_I64:
+                return 1'b1;
+            default:
+                return 1'b0;
+        endcase
+    endfunction
+
+    // Helper function: Check if mem_op_t requires sign extension
+    function automatic logic mem_op_is_signed(mem_op_t op);
+        case (op)
+            MEM_LOAD_I8_S, MEM_LOAD_I16_S, MEM_LOAD_I32_S:
+                return 1'b1;
+            default:
+                return 1'b0;
+        endcase
+    endfunction
 
     // =========================================================================
     // Execution State

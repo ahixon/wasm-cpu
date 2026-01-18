@@ -79,24 +79,13 @@ module wasm_runner;
     logic [31:0] dbg_mem_rd_addr = 0;
     logic [31:0] dbg_mem_rd_data;
 
-    // CPU -> Memory interface
-    logic mem_rd_en_o;
-    logic [31:0] mem_rd_addr_o;
-    mem_op_t mem_rd_op_o;
-    logic mem_wr_en_o;
-    logic [31:0] mem_wr_addr_o;
-    mem_op_t mem_wr_op_o;
-    logic [63:0] mem_wr_data_o;
-    logic mem_grow_en_o;
-    logic [31:0] mem_grow_pages_o;
-
-    // Memory -> CPU interface
-    logic [63:0] mem_rd_data_i;
-    logic mem_rd_valid_i;
-    logic mem_wr_valid_i;
-    logic [31:0] mem_current_pages_i;
-    logic [31:0] mem_grow_result_i;
-    trap_t mem_trap_i;
+    // CPU -> Memory interface (struct-based, names must match CPU ports for .* connection)
+    mem_bus_req_t  mem_req_o;
+    mem_bus_resp_t mem_resp_i;
+    mem_mgmt_req_t mem_mgmt_req_o;
+    mem_mgmt_resp_t mem_mgmt_resp_i;
+    mem_op_t       mem_op_o;
+    trap_t         mem_trap_i;
 
     wasm_cpu #(.CODE_SIZE(65536), .STACK_SIZE(1024), .MEM_PAGES(1024)) dut (.*);
 
@@ -104,27 +93,19 @@ module wasm_runner;
     wasm_memory #(.MAX_PAGES(1024)) linear_memory (
         .clk(clk),
         .rst_n(rst_n),
-        .init_en(mem_init_en),
-        .init_pages(mem_init_pages),
-        .init_max_pages(mem_init_max_pages),
+        // Memory bus interface (struct-based)
+        .mem_req_i(mem_req_o),
+        .mem_resp_o(mem_resp_i),
+        .mem_op_i(mem_op_o),
+        .mem_mgmt_req_i(mem_mgmt_req_o),
+        .mem_mgmt_resp_o(mem_mgmt_resp_i),
+        // Data segment initialization
         .data_wr_en(mem_data_wr_en),
         .data_wr_addr(mem_data_wr_addr),
         .data_wr_data(mem_data_wr_data),
-        .rd_en(mem_rd_en_o),
-        .rd_addr(mem_rd_addr_o),
-        .rd_op(mem_rd_op_o),
-        .rd_data(mem_rd_data_i),
-        .rd_valid(mem_rd_valid_i),
-        .wr_en(mem_wr_en_o),
-        .wr_addr(mem_wr_addr_o),
-        .wr_op(mem_wr_op_o),
-        .wr_data(mem_wr_data_o),
-        .wr_valid(mem_wr_valid_i),
-        .grow_en(mem_grow_en_o),
-        .grow_pages(mem_grow_pages_o),
-        .current_pages(mem_current_pages_i),
-        .grow_result(mem_grow_result_i),
+        // Status
         .trap(mem_trap_i),
+        // Debug interface
         .dbg_rd_en(dbg_mem_rd_en),
         .dbg_rd_addr(dbg_mem_rd_addr),
         .dbg_rd_data(dbg_mem_rd_data)

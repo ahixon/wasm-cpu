@@ -104,24 +104,17 @@ module wasm_cpu
     input  logic [31:0] dbg_mem_rd_addr,
     output logic [31:0] dbg_mem_rd_data,
 
-    // External memory interface (memory module is instantiated outside CPU)
-    // CPU -> Memory (outputs)
-    output logic        mem_rd_en_o,
-    output logic [31:0] mem_rd_addr_o,
-    output mem_op_t     mem_rd_op_o,
-    output logic        mem_wr_en_o,
-    output logic [31:0] mem_wr_addr_o,
-    output mem_op_t     mem_wr_op_o,
-    output logic [63:0] mem_wr_data_o,
-    output logic        mem_grow_en_o,
-    output logic [31:0] mem_grow_pages_o,
-    // Memory -> CPU (inputs)
-    input  logic [63:0] mem_rd_data_i,
-    input  logic        mem_rd_valid_i,
-    input  logic        mem_wr_valid_i,
-    input  logic [31:0] mem_current_pages_i,
-    input  logic [31:0] mem_grow_result_i,
-    input  trap_t       mem_trap_i
+    // Memory bus interface (directly usable with AXI adapter)
+    output mem_bus_req_t  mem_req_o,      // Memory bus request
+    input  mem_bus_resp_t mem_resp_i,     // Memory bus response
+
+    // Memory management interface (WASM-specific: init, grow)
+    output mem_mgmt_req_t  mem_mgmt_req_o,  // Management request
+    input  mem_mgmt_resp_t mem_mgmt_resp_i, // Management response
+
+    // WASM-specific memory operation info (for sign extension in memory adapter)
+    output mem_op_t     mem_op_o,         // Original WASM memory operation
+    input  trap_t       mem_trap_i        // Memory trap (out of bounds, etc.)
 );
 
     // =========================================================================
@@ -398,23 +391,35 @@ module wasm_cpu
     logic [31:0] mem_grow_result;
     trap_t       mem_trap;
 
-    // Connect internal signals to external memory interface ports
-    assign mem_rd_en_o = mem_rd_en;
-    assign mem_rd_addr_o = mem_rd_addr;
-    assign mem_rd_op_o = mem_rd_op;
-    assign mem_wr_en_o = mem_wr_en;
-    assign mem_wr_addr_o = mem_wr_addr;
-    assign mem_wr_op_o = mem_wr_op;
-    assign mem_wr_data_o = mem_wr_data;
-    assign mem_grow_en_o = mem_grow_en;
-    assign mem_grow_pages_o = mem_grow_pages;
+    // Connect internal signals to external memory bus interface (struct-based)
+    // Memory bus request - combine read/write into single request
+    assign mem_req_o.valid = mem_rd_en | mem_wr_en;
+    assign mem_req_o.write = mem_wr_en;
+    assign mem_req_o.addr  = mem_wr_en ? mem_wr_addr : mem_rd_addr;
+    assign mem_req_o.size  = mem_op_to_size(mem_wr_en ? mem_wr_op : mem_rd_op);
+    assign mem_req_o.wdata = mem_wr_data;
 
-    assign mem_rd_data = mem_rd_data_i;
-    assign mem_rd_valid = mem_rd_valid_i;
-    assign mem_wr_valid = mem_wr_valid_i;
-    assign mem_current_pages = mem_current_pages_i;
-    assign mem_grow_result = mem_grow_result_i;
+    // Memory bus response
+    assign mem_rd_data  = mem_resp_i.rdata;
+    assign mem_rd_valid = mem_resp_i.rvalid && !mem_wr_en && !mem_resp_i.error;  // Read response valid
+    assign mem_wr_valid = mem_resp_i.ready && mem_wr_en && !mem_resp_i.error;    // Write accepted (not valid if error)
+
+    // Memory management request (WASM-specific)
+    assign mem_mgmt_req_o.init_valid     = mem_init_en;
+    assign mem_mgmt_req_o.init_pages     = mem_init_pages;
+    assign mem_mgmt_req_o.init_max_pages = mem_init_max_pages;
+    assign mem_mgmt_req_o.grow_valid     = mem_grow_en;
+    assign mem_mgmt_req_o.grow_pages     = mem_grow_pages;
+
+    // Memory management response
+    assign mem_current_pages = mem_mgmt_resp_i.current_pages;
+    assign mem_grow_result   = mem_mgmt_resp_i.grow_result;
+
+    // Memory trap from external memory
     assign mem_trap = mem_trap_i;
+
+    // Export the current memory operation type for sign extension handling
+    assign mem_op_o = mem_wr_en ? mem_wr_op : mem_rd_op;
 
     // =========================================================================
     // Local Variables
