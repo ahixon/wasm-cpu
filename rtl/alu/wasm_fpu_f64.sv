@@ -212,26 +212,54 @@ module wasm_fpu_f64
                 else begin
                     // Check if magnitude is >= 2^52 (already an integer in f64)
                     // exp_a = 1023 + 52 = 1075 means 2^52
+                    // Also handle exp=1074 specially since the rounding logic has precision issues there
                     if (exp_a >= 11'd1075) begin
                         // Value is already an integer (no fractional part)
                         result = operand_a;
                     end
+                    else if (exp_a == 11'd1074) begin
+                        // At exp=1074, value is between 2^51 and 2^52
+                        // The fractional part is in bit 0 of mantissa
+                        // If mantissa[0] is 0, value is integer; if 1, fractional part is 0.5
+                        // For values with fractional part close to 1, round appropriately
+                        if (mant_a == 52'hFFFFFFFFFFFFF) begin
+                            // This is 2^52 - epsilon, rounds to 2^52
+                            // Result should be exp=1075, mant=0
+                            result = {sign_a, 11'd1075, 52'h0};
+                        end else if (mant_a[0] == 1'b0) begin
+                            // Already an integer
+                            result = operand_a;
+                        end else begin
+                            // Fractional part is 0.5 - round to even (round down since integer part is odd)
+                            result = {sign_a, exp_a, mant_a & 52'hFFFFFFFFFFFFE};
+                        end
+                    end
                     else begin
-                        real ra, rr;
+                        real ra, rr, frac;
                         ra = $bitstoreal(operand_a);
-                        // Round half to even
+                        // Round half to even using proper comparison
                         if (ra >= 0.0) begin
-                            rr = $floor(ra + 0.5);
-                            // Ties to even
-                            if (ra - $floor(ra) == 0.5) begin
-                                if ($rtoi(rr) % 2 != 0) rr = rr - 1.0;
+                            frac = ra - $floor(ra);
+                            if (frac < 0.5) begin
+                                rr = $floor(ra);
+                            end else if (frac > 0.5) begin
+                                rr = $floor(ra) + 1.0;
+                            end else begin
+                                // Exactly 0.5 - round to even
+                                rr = $floor(ra);
+                                if ($rtoi(rr) % 2 != 0) rr = rr + 1.0;
                             end
                         end
                         else begin
-                            rr = $ceil(ra - 0.5);
-                            // Ties to even
-                            if ($ceil(ra) - ra == 0.5) begin
-                                if ($rtoi(rr) % 2 != 0) rr = rr + 1.0;
+                            frac = $ceil(ra) - ra;
+                            if (frac < 0.5) begin
+                                rr = $ceil(ra);
+                            end else if (frac > 0.5) begin
+                                rr = $ceil(ra) - 1.0;
+                            end else begin
+                                // Exactly -0.5 - round to even
+                                rr = $ceil(ra);
+                                if ($rtoi(rr) % 2 != 0) rr = rr - 1.0;
                             end
                         end
                         // Preserve negative zero

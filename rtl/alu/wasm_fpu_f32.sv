@@ -94,14 +94,19 @@ module wasm_fpu_f32
                         break;
                     end
                 end
-                // exp_d = 874 + shift
+                // exp_d = 874 + shift (subnormal value = mant_f * 2^(-149), leading 1 at position shift
+                // means value = 1.xxx * 2^(shift-149), so biased exp = shift-149+1023 = shift+874)
                 exp_d = 11'd874 + shift;
-                // After normalization, leading 1 becomes implicit
-                // Shift left to align, then mask off the leading 1
-                // For shift=0, mant=0x000001: shift left by 22 to get 0x400000, mask to get 0x000000
-                // For shift=1, mant=0x000002: shift left by 21 to get 0x400000, mask to get 0x000000
-                // For shift=1, mant=0x000003: shift left by 21 to get 0x600000, mask to get 0x200000
-                mant_d = {((mant_f << (22 - shift)) & 23'h3FFFFF), 29'b0};
+                // Mantissa: remove the leading 1 (at position shift), keep bits [shift-1:0]
+                // These 'shift' bits need to be placed at the TOP of the 52-bit mantissa
+                if (shift > 0) begin
+                    logic [51:0] masked_mant;
+                    masked_mant = {29'b0, mant_f} & ((52'b1 << shift) - 1);  // Keep only bits below leading 1
+                    mant_d = masked_mant << (52 - shift);
+                end else begin
+                    // shift == 0 means only bit 0 was set, no mantissa bits left
+                    mant_d = 52'h0;
+                end
             end
         end
         else begin
@@ -139,16 +144,43 @@ module wasm_fpu_f32
         end
         else begin
             // Normal: check if in f32 range
-            if (exp_d < 11'd874) begin
-                // Underflow to zero (too small even for subnormal)
+            if (exp_d < 11'd873) begin
+                // Underflow to zero (too small even for subnormal with rounding)
                 exp_f = 8'h00;
                 mant_f = 23'h0;
             end
             else if (exp_d < 11'd897) begin
-                // Subnormal f32 range (exp_d 874 to 896 inclusive)
+                // Subnormal f32 range - apply proper rounding
+                logic [10:0] shift_amt;
+                logic [52:0] full_mant;
+                logic [23:0] shifted;
+                logic        sub_round, sub_sticky, sub_lsb;
+                logic [23:0] sub_rounded;
+
                 exp_f = 8'h00;
-                // TODO: proper rounding for subnormals
-                mant_f = ({1'b1, mant_d[51:29]} >> (11'd897 - exp_d));
+                shift_amt = 11'd897 - exp_d;  // 1 to 24
+                full_mant = {1'b1, mant_d};   // 53 bits total
+
+                if (shift_amt <= 11'd24) begin
+                    shifted = full_mant[52:29] >> shift_amt;
+                    sub_round = (full_mant >> (28 + shift_amt)) & 1'b1;
+                    sub_sticky = |(full_mant & ((53'b1 << (28 + shift_amt)) - 1));
+                    sub_lsb = shifted[0];
+
+                    if (sub_round && (sub_sticky || sub_lsb)) begin
+                        sub_rounded = shifted + 1'b1;
+                        if (sub_rounded[23]) begin
+                            exp_f = 8'h01;
+                            mant_f = 23'h0;
+                        end else begin
+                            mant_f = sub_rounded[22:0];
+                        end
+                    end else begin
+                        mant_f = shifted[22:0];
+                    end
+                end else begin
+                    mant_f = 23'h0;
+                end
             end
             else if (exp_d > 11'd896 + 11'd254) begin
                 // Overflow to infinity

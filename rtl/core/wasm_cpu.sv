@@ -58,6 +58,7 @@ module wasm_cpu
 
     // Element table initialization interface (for call_indirect)
     input  logic        elem_init_en,
+    input  logic [1:0]  elem_init_table_idx,  // Which table (0-3)
     input  logic [15:0] elem_init_idx,
     input  logic [15:0] elem_init_func_idx,  // Function index stored in table
 
@@ -154,10 +155,14 @@ module wasm_cpu
     } type_entry_t;
     type_entry_t type_table [0:255];  // Support up to 256 types
 
-    // Element table (for call_indirect) - stores function indices
+    // Element tables (for call_indirect) - stores function indices
     // Entry is 16-bit func index, with 0xFFFF meaning uninitialized
-    logic [15:0] elem_table [0:1023];  // Support up to 1024 table entries
-    logic [15:0] elem_table_size;       // Number of initialized entries
+    // Support up to 4 tables with 256 entries each
+    logic [15:0] elem_table_0 [0:255];
+    logic [15:0] elem_table_1 [0:255];
+    logic [15:0] elem_table_2 [0:255];
+    logic [15:0] elem_table_3 [0:255];
+    logic [15:0] elem_table_size [0:3];  // Size of each table
 
     // =========================================================================
     // Operand Stack
@@ -609,16 +614,28 @@ module wasm_cpu
     // =========================================================================
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            elem_table_size <= 16'h0;
+            // Initialize all table sizes to 0
+            for (int t = 0; t < 4; t++) begin
+                elem_table_size[t] <= 16'h0;
+            end
             // Initialize all entries to 0xFFFF (uninitialized marker)
-            for (int i = 0; i < 1024; i++) begin
-                elem_table[i] <= 16'hFFFF;
+            for (int i = 0; i < 256; i++) begin
+                elem_table_0[i] <= 16'hFFFF;
+                elem_table_1[i] <= 16'hFFFF;
+                elem_table_2[i] <= 16'hFFFF;
+                elem_table_3[i] <= 16'hFFFF;
             end
         end else if (elem_init_en) begin
-            elem_table[elem_init_idx] <= elem_init_func_idx;
-            // Track the highest index + 1 as size
-            if (elem_init_idx >= elem_table_size) begin
-                elem_table_size <= elem_init_idx + 16'h1;
+            // Write to the appropriate table based on table index
+            case (elem_init_table_idx)
+                2'd0: elem_table_0[elem_init_idx[7:0]] <= elem_init_func_idx;
+                2'd1: elem_table_1[elem_init_idx[7:0]] <= elem_init_func_idx;
+                2'd2: elem_table_2[elem_init_idx[7:0]] <= elem_init_func_idx;
+                2'd3: elem_table_3[elem_init_idx[7:0]] <= elem_init_func_idx;
+            endcase
+            // Track the highest index + 1 as size for this table
+            if (elem_init_idx >= elem_table_size[elem_init_table_idx]) begin
+                elem_table_size[elem_init_table_idx] <= elem_init_idx + 16'h1;
             end
         end
     end
@@ -1018,21 +1035,38 @@ module wasm_cpu
                         end
 
                         OP_CALL_INDIRECT: begin
-                            // Indirect call - operand_a (TOS) is the table index
+                            // Indirect call - operand_a (TOS) is the element index within the table
                             // saved_decoded.immediate = type_index (expected type)
-                            // saved_decoded.immediate2 = table_index (which table, usually 0)
-                            logic [31:0] table_idx;
+                            // saved_decoded.immediate2 = table_index (which table, 0-3)
+                            logic [31:0] elem_idx;
                             logic [15:0] target_func_idx;
+                            logic [1:0] which_table;
+                            logic [15:0] table_size;
 
-                            table_idx = operand_a.value[31:0];
+                            elem_idx = operand_a.value[31:0];
+                            which_table = saved_decoded.immediate2[1:0];
 
-                            // Check if table index is out of bounds
-                            if (table_idx >= {16'b0, elem_table_size}) begin
+                            // Get the size of the selected table
+                            case (which_table)
+                                2'd0: table_size = elem_table_size[0];
+                                2'd1: table_size = elem_table_size[1];
+                                2'd2: table_size = elem_table_size[2];
+                                2'd3: table_size = elem_table_size[3];
+                            endcase
+
+                            // Check if element index is out of bounds
+                            if (elem_idx >= {16'b0, table_size}) begin
                                 trapped <= 1'b1;
                                 trap_code <= TRAP_UNDEFINED_ELEMENT;
                                 state <= STATE_TRAP;
                             end else begin
-                                target_func_idx = elem_table[table_idx[9:0]];
+                                // Get function index from the selected table
+                                case (which_table)
+                                    2'd0: target_func_idx = elem_table_0[elem_idx[7:0]];
+                                    2'd1: target_func_idx = elem_table_1[elem_idx[7:0]];
+                                    2'd2: target_func_idx = elem_table_2[elem_idx[7:0]];
+                                    2'd3: target_func_idx = elem_table_3[elem_idx[7:0]];
+                                endcase
 
                                 // Check if element is uninitialized
                                 if (target_func_idx == 16'hFFFF) begin
@@ -1055,14 +1089,14 @@ module wasm_cpu
                                         trap_code <= TRAP_INDIRECT_CALL_TYPE_MISMATCH;
                                         state <= STATE_TRAP;
                                     end else begin
-                                        // Pop the table index from stack
+                                        // Pop the element index from stack
                                         stack_pop_en <= 1'b1;
 
                                         // Set up the call like OP_CALL does
                                         call_func_idx <= target_func_idx;
                                         call_param_count <= func_table[target_func_idx].param_count;
                                         call_arg_idx <= 8'd0;
-                                        // Add +1 to initial peek offset because the table index pop
+                                        // Add +1 to initial peek offset because the element index pop
                                         // won't take effect until the next cycle (same cycle as first STATE_CALL)
                                         call_peek_offset <= {8'b0, func_table[target_func_idx].param_count};
                                         call_new_local_base <= current_frame.local_base +

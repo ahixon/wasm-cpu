@@ -55,6 +55,7 @@ module wasm_conv
             end
             else begin
                 // Subnormal f32 - normalize for f64
+                // Find position of leading 1 bit
                 shift = 0;
                 for (int i = 22; i >= 0; i--) begin
                     if (mant_f[i]) begin
@@ -62,8 +63,31 @@ module wasm_conv
                         break;
                     end
                 end
+                // Exponent: subnormal f32 has implicit exp of -126
+                // After normalizing by shifting left (23-1-shift) positions,
+                // the effective exponent becomes -126 - (22 - shift) = -126 + shift - 22
+                // In f64 bias: -126 + shift - 22 + 1023 = 875 + shift
+                // Wait, let me recalculate:
+                // Subnormal value = mant_f * 2^(-149) where -149 = -126 - 23
+                // Leading 1 at position 'shift' means value = 2^shift * (normalized mantissa) * 2^(-149)
+                // = 1.xxx * 2^(shift - 149) (after normalization, the leading 1 is implicit)
+                // Actually no: value = 2^shift * (1 + remaining_frac) * 2^(-23) * 2^(-126)
+                //           = (1 + remaining_frac) * 2^(shift - 23 - 126)
+                //           = (1 + remaining_frac) * 2^(shift - 149)
+                // For f64: exp_unbiased = shift - 149, so exp_biased = shift - 149 + 1023 = shift + 874
                 exp_d = 11'd874 + shift;
-                mant_d = {((mant_f << (22 - shift)) & 23'h3FFFFF), 29'b0};
+                // Mantissa: remove the leading 1 (at position shift), keep bits [shift-1:0]
+                // These 'shift' bits need to be placed at the TOP of the 52-bit mantissa
+                // Formula: result[51:52-shift] = mant_f[shift-1:0], rest = 0
+                // This means shift left by (52 - shift) positions
+                if (shift > 0) begin
+                    logic [51:0] masked_mant;
+                    masked_mant = {29'b0, mant_f} & ((52'b1 << shift) - 1);  // Keep only bits below leading 1
+                    mant_d = masked_mant << (52 - shift);
+                end else begin
+                    // shift == 0 means only bit 0 was set, no mantissa bits left
+                    mant_d = 52'h0;
+                end
             end
         end
         else begin
@@ -97,13 +121,55 @@ module wasm_conv
             mant_f = mant_d[51:29];
         end
         else begin
-            if (exp_d < 11'd874) begin
+            if (exp_d < 11'd873) begin
+                // Definitely underflow to zero
                 exp_f = 8'h00;
                 mant_f = 23'h0;
             end
             else if (exp_d < 11'd897) begin
+                // Subnormal f32 result - apply proper rounding
+                logic [10:0] shift_amt;
+                logic [52:0] full_mant;  // 1 bit + 52 bits mantissa
+                logic [23:0] shifted;
+                logic        sub_round, sub_sticky, sub_lsb;
+                logic [23:0] sub_rounded;
+
                 exp_f = 8'h00;
-                mant_f = ({1'b1, mant_d[51:29]} >> (11'd897 - exp_d));
+                shift_amt = 11'd897 - exp_d;  // 1 to 23
+                full_mant = {1'b1, mant_d};   // 53 bits total
+
+                // We need to shift right by shift_amt and round
+                // After shift, we take bits [52:30] as the 23-bit subnormal mantissa
+                // Round bit is bit 29, sticky is bits 28:0 OR'd together
+                if (shift_amt <= 11'd24) begin
+                    // Perform the shift
+                    shifted = full_mant[52:29] >> shift_amt;
+
+                    // Calculate round and sticky bits
+                    // The round bit is at position (29 + shift_amt - 1) in full_mant
+                    // Actually, after conceptual shift by shift_amt:
+                    // - new bit 29 = old bit (29 + shift_amt) = round bit
+                    // - bits below that = sticky
+                    sub_round = (full_mant >> (28 + shift_amt)) & 1'b1;
+                    sub_sticky = |(full_mant & ((53'b1 << (28 + shift_amt)) - 1));
+                    sub_lsb = shifted[0];
+
+                    if (sub_round && (sub_sticky || sub_lsb)) begin
+                        sub_rounded = shifted + 1'b1;
+                        // Check if rounding caused overflow to normal
+                        if (sub_rounded[23]) begin
+                            exp_f = 8'h01;  // Becomes smallest normal
+                            mant_f = 23'h0;
+                        end else begin
+                            mant_f = sub_rounded[22:0];
+                        end
+                    end else begin
+                        mant_f = shifted[22:0];
+                    end
+                end else begin
+                    // Shift amount too large, underflow to zero
+                    mant_f = 23'h0;
+                end
             end
             else if (exp_d > 11'd1150) begin
                 exp_f = 8'hFF;
@@ -131,6 +197,202 @@ module wasm_conv
         end
 
         return {sign_d, exp_f, mant_f};
+    endfunction
+
+    // Convert signed i64 to f32 with proper IEEE round-to-nearest-even
+    function automatic logic [31:0] i64s_to_f32_bits(input logic [63:0] val);
+        logic        sign;
+        logic [63:0] abs_val;
+        logic [5:0]  leading_one;  // Position of leading 1 (0-63)
+        logic [7:0]  exp_f;
+        logic [22:0] mant_f;
+        logic [63:0] shifted;
+        logic        round_bit, sticky_bit, lsb;
+        logic [24:0] mant_with_round;  // 25 bits to detect overflow
+        int i;
+
+        // Handle zero
+        if (val == 64'h0) return 32'h0;
+
+        // Extract sign and absolute value
+        sign = val[63];
+        abs_val = sign ? -val : val;
+
+        // Find position of leading 1
+        leading_one = 0;
+        for (i = 63; i >= 0; i = i - 1) begin
+            if (abs_val[i]) begin
+                leading_one = i[5:0];
+                break;
+            end
+        end
+
+        // If the value fits in 24 bits, no rounding needed
+        if (leading_one < 24) begin
+            exp_f = leading_one + 8'd127;
+            mant_f = (abs_val << (23 - leading_one));
+            return {sign, exp_f, mant_f[22:0]};
+        end
+
+        // Need to round - shift so bit 23 aligns with leading 1
+        // shifted[23] = leading 1, shifted[22:0] = mantissa bits
+        // bits below shifted[0] determine rounding
+        shifted = abs_val >> (leading_one - 23);
+
+        // Round bit is the bit just below the mantissa
+        round_bit = (abs_val >> (leading_one - 24)) & 1'b1;
+
+        // Sticky bit is OR of all bits below round bit
+        if (leading_one >= 25) begin
+            sticky_bit = |(abs_val & ((64'b1 << (leading_one - 24)) - 1));
+        end else begin
+            sticky_bit = 1'b0;
+        end
+
+        lsb = shifted[0];
+
+        // Round to nearest, ties to even
+        if (round_bit && (sticky_bit || lsb)) begin
+            mant_with_round = shifted[23:0] + 1'b1;
+        end else begin
+            mant_with_round = shifted[23:0];
+        end
+
+        // Check for mantissa overflow (rounding caused carry into bit 24)
+        if (mant_with_round[24]) begin
+            exp_f = leading_one + 8'd127 + 1;
+            mant_f = mant_with_round[23:1];
+        end else begin
+            exp_f = leading_one + 8'd127;
+            mant_f = mant_with_round[22:0];
+        end
+
+        // Check for overflow to infinity
+        if (exp_f >= 8'd255) begin
+            return {sign, 8'hFF, 23'h0};
+        end
+
+        return {sign, exp_f, mant_f};
+    endfunction
+
+    // Convert unsigned i64 to f32 with proper IEEE round-to-nearest-even
+    function automatic logic [31:0] i64u_to_f32_bits(input logic [63:0] val);
+        logic [5:0]  leading_one;
+        logic [7:0]  exp_f;
+        logic [22:0] mant_f;
+        logic [63:0] shifted;
+        logic        round_bit, sticky_bit, lsb;
+        logic [24:0] mant_with_round;  // 25 bits to detect overflow
+        int i;
+
+        // Handle zero
+        if (val == 64'h0) return 32'h0;
+
+        // Find position of leading 1
+        leading_one = 0;
+        for (i = 63; i >= 0; i = i - 1) begin
+            if (val[i]) begin
+                leading_one = i[5:0];
+                break;
+            end
+        end
+
+        // If the value fits in 24 bits, no rounding needed
+        if (leading_one < 24) begin
+            exp_f = leading_one + 8'd127;
+            mant_f = (val << (23 - leading_one));
+            return {1'b0, exp_f, mant_f[22:0]};
+        end
+
+        // Need to round
+        shifted = val >> (leading_one - 23);
+        round_bit = (val >> (leading_one - 24)) & 1'b1;
+
+        if (leading_one >= 25) begin
+            sticky_bit = |(val & ((64'b1 << (leading_one - 24)) - 1));
+        end else begin
+            sticky_bit = 1'b0;
+        end
+
+        lsb = shifted[0];
+
+        if (round_bit && (sticky_bit || lsb)) begin
+            mant_with_round = shifted[23:0] + 1'b1;
+        end else begin
+            mant_with_round = shifted[23:0];
+        end
+
+        if (mant_with_round[24]) begin
+            exp_f = leading_one + 8'd127 + 1;
+            mant_f = mant_with_round[23:1];
+        end else begin
+            exp_f = leading_one + 8'd127;
+            mant_f = mant_with_round[22:0];
+        end
+
+        if (exp_f >= 8'd255) begin
+            return {1'b0, 8'hFF, 23'h0};
+        end
+
+        return {1'b0, exp_f, mant_f};
+    endfunction
+
+    // Convert unsigned i64 to f64 with proper IEEE round-to-nearest-even
+    function automatic logic [63:0] i64u_to_f64_bits(input logic [63:0] val);
+        logic [5:0]  leading_one;
+        logic [10:0] exp_d;
+        logic [51:0] mant_d;
+        logic [63:0] shifted;
+        logic        round_bit, sticky_bit, lsb;
+        logic [53:0] mant_with_round;  // 54 bits to detect overflow
+        int i;
+
+        // Handle zero
+        if (val == 64'h0) return 64'h0;
+
+        // Find position of leading 1
+        leading_one = 0;
+        for (i = 63; i >= 0; i = i - 1) begin
+            if (val[i]) begin
+                leading_one = i[5:0];
+                break;
+            end
+        end
+
+        // If the value fits in 53 bits, no rounding needed
+        if (leading_one < 53) begin
+            exp_d = {5'b0, leading_one} + 11'd1023;
+            mant_d = (val << (52 - leading_one));
+            return {1'b0, exp_d, mant_d[51:0]};
+        end
+
+        // Need to round (leading_one is 53 to 63)
+        shifted = val >> (leading_one - 52);
+        round_bit = (val >> (leading_one - 53)) & 1'b1;
+
+        if (leading_one >= 54) begin
+            sticky_bit = |(val & ((64'b1 << (leading_one - 53)) - 1));
+        end else begin
+            sticky_bit = 1'b0;
+        end
+
+        lsb = shifted[0];
+
+        if (round_bit && (sticky_bit || lsb)) begin
+            mant_with_round = shifted[52:0] + 1'b1;
+        end else begin
+            mant_with_round = shifted[52:0];
+        end
+
+        if (mant_with_round[53]) begin
+            exp_d = {5'b0, leading_one} + 11'd1023 + 1;
+            mant_d = mant_with_round[52:1];
+        end else begin
+            exp_d = {5'b0, leading_one} + 11'd1023;
+            mant_d = mant_with_round[51:0];
+        end
+
+        return {1'b0, exp_d, mant_d};
     endfunction
 
     // Convert f64 (real) to signed 64-bit integer with truncation toward zero
@@ -205,7 +467,8 @@ module wasm_conv
                     real r;
                     longint li;
                     r = $bitstoreal(f32_to_f64_bits(f32_in));
-                    if (r >= 2147483648.0 || r < -2147483648.0) begin
+                    // Valid range after truncation: -2147483648 to 2147483647
+                    if (r >= 2147483648.0 || r <= -2147483649.0) begin
                         trap = TRAP_INVALID_CONV;
                     end else begin
                         li = $rtoi(r);
@@ -241,7 +504,10 @@ module wasm_conv
                     real r;
                     logic [63:0] trunc_result;
                     r = $bitstoreal(f64_in);
-                    if (r >= 2147483648.0 || r < -2147483648.0) begin
+                    // Check if truncated value would be out of i32 range
+                    // Valid range: -2147483648 to 2147483647 (after truncation toward zero)
+                    // So input must be: > -2147483649 and < 2147483648
+                    if (r >= 2147483648.0 || r <= -2147483649.0) begin
                         trap = TRAP_INVALID_CONV;
                     end else begin
                         trunc_result = f64_to_i64_trunc(f64_in);
@@ -357,21 +623,12 @@ module wasm_conv
 
             // f32.convert_i64_s
             OP_F32_CONVERT_I64_S: begin
-                real r;
-                r = $signed(i64_in);
-                result = {32'b0, f64_to_f32_bits($realtobits(r))};
+                result = {32'b0, i64s_to_f32_bits(i64_in)};
             end
 
             // f32.convert_i64_u
             OP_F32_CONVERT_I64_U: begin
-                real r;
-                // Handle unsigned 64-bit carefully
-                if (i64_in[63]) begin
-                    r = 9223372036854775808.0 + $itor({1'b0, i64_in[62:0]});
-                end else begin
-                    r = $itor(i64_in);
-                end
-                result = {32'b0, f64_to_f32_bits($realtobits(r))};
+                result = {32'b0, i64u_to_f32_bits(i64_in)};
             end
 
             // f32.demote_f64
@@ -406,13 +663,7 @@ module wasm_conv
 
             // f64.convert_i64_u
             OP_F64_CONVERT_I64_U: begin
-                real r;
-                if (i64_in[63]) begin
-                    r = 9223372036854775808.0 + $itor({1'b0, i64_in[62:0]});
-                end else begin
-                    r = $itor(i64_in);
-                end
-                result = $realtobits(r);
+                result = i64u_to_f64_bits(i64_in);
             end
 
             // f64.promote_f32
@@ -470,16 +721,18 @@ module wasm_conv
                         if (f32_is_nan) begin
                             result = 64'h0;
                         end else begin
+                            logic [63:0] f64_bits;
                             real r;
-                            r = $bitstoreal(f32_to_f64_bits(f32_in));
+                            logic [63:0] trunc_result;
+                            f64_bits = f32_to_f64_bits(f32_in);
+                            r = $bitstoreal(f64_bits);
                             if (r >= 2147483648.0) begin
                                 result = 64'h7FFFFFFF;  // INT32_MAX
                             end else if (r <= -2147483649.0) begin
                                 result = 64'hFFFFFFFF80000000;  // INT32_MIN sign-extended
                             end else begin
-                                result = {{32{1'b0}}, $rtoi(r)};
-                                if (r < 0 && result[31:0] != 0)
-                                    result[31:0] = -$rtoi(-r);
+                                trunc_result = f64_to_i64_trunc(f64_bits);
+                                result = {{32{trunc_result[31]}}, trunc_result[31:0]};
                             end
                         end
                     end
