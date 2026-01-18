@@ -56,9 +56,24 @@ module wasm_cpu
     input  logic [7:0]  global_init_idx,
     input  global_entry_t global_init_data,
 
-    // Result output
+    // Element table initialization interface (for call_indirect)
+    input  logic        elem_init_en,
+    input  logic [15:0] elem_init_idx,
+    input  logic [15:0] elem_init_func_idx,  // Function index stored in table
+
+    // Type table initialization interface (for multi-value block types)
+    input  logic        type_init_en,
+    input  logic [7:0]  type_init_idx,
+    input  logic [7:0]  type_init_param_count,
+    input  logic [7:0]  type_init_result_count,
+    input  logic [31:0] type_init_param_types,
+    input  logic [31:0] type_init_result_types,
+
+    // Result output (supports multi-value returns)
     output logic        result_valid,
-    output stack_entry_t result_value,
+    output stack_entry_t result_value,          // For single-value backward compatibility
+    output logic [7:0]  result_count,           // Number of return values
+    output stack_entry_t result_values [0:15],  // Up to 16 return values
 
     // Debug interface
     output logic [31:0] dbg_pc,
@@ -108,6 +123,10 @@ module wasm_cpu
     logic [15:0] call_peek_offset;    // Peek offset for reading arguments during call
     stack_entry_t call_saved_arg;     // Saved argument from previous peek
 
+    // Result capture state - for multi-value returns
+    logic [7:0]  capture_result_idx;    // Current result being captured (0 = TOS = last result)
+    logic [7:0]  capture_result_count;  // Total number of results to capture
+
     // Code memory
     logic [7:0] code_mem [0:CODE_SIZE-1];
     logic [7:0] instr_bytes [0:15];
@@ -120,6 +139,21 @@ module wasm_cpu
 
     // Function table
     func_entry_t func_table [0:MAX_FUNCTIONS-1];
+
+    // Type table - stores full type signature for each type index
+    // Used for multi-value block types and call_indirect type checking
+    typedef struct packed {
+        logic [7:0] param_count;
+        logic [7:0] result_count;
+        logic [31:0] param_types;   // Up to 8 params, 4 bits each (valtype_t)
+        logic [31:0] result_types;  // Up to 8 results, 4 bits each (valtype_t)
+    } type_entry_t;
+    type_entry_t type_table [0:255];  // Support up to 256 types
+
+    // Element table (for call_indirect) - stores function indices
+    // Entry is 16-bit func index, with 0xFFFF meaning uninitialized
+    logic [15:0] elem_table [0:1023];  // Support up to 1024 table entries
+    logic [15:0] elem_table_size;       // Number of initialized entries
 
     // =========================================================================
     // Operand Stack
@@ -211,6 +245,11 @@ module wasm_cpu
         // Default offsets for most operations
         if (state == STATE_CALL) begin
             stack_peek_offset = call_peek_offset;  // Use call-specific offset
+            stack_peek_offset2 = 16'd0;
+        end else if (state == STATE_CAPTURE_RESULTS) begin
+            // Capture results: peek at stack starting from TOS (offset 0)
+            // capture_result_idx is the current index being captured
+            stack_peek_offset = {8'b0, capture_result_idx};
             stack_peek_offset2 = 16'd0;
         end else begin
             stack_peek_offset = 16'd1;   // TOS-1
@@ -556,6 +595,43 @@ module wasm_cpu
     end
 
     // =========================================================================
+    // Element Table Interface (for call_indirect)
+    // =========================================================================
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            elem_table_size <= 16'h0;
+            // Initialize all entries to 0xFFFF (uninitialized marker)
+            for (int i = 0; i < 1024; i++) begin
+                elem_table[i] <= 16'hFFFF;
+            end
+        end else if (elem_init_en) begin
+            elem_table[elem_init_idx] <= elem_init_func_idx;
+            // Track the highest index + 1 as size
+            if (elem_init_idx >= elem_table_size) begin
+                elem_table_size <= elem_init_idx + 16'h1;
+            end
+        end
+    end
+
+    // =========================================================================
+    // Type Table Interface (for multi-value block types)
+    // =========================================================================
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            // Initialize all entries to single-value types by default
+            for (int i = 0; i < 256; i++) begin
+                type_table[i].param_count <= 8'h0;
+                type_table[i].result_count <= 8'h1;  // Default to 1 result
+            end
+        end else if (type_init_en) begin
+            type_table[type_init_idx].param_count <= type_init_param_count;
+            type_table[type_init_idx].result_count <= type_init_result_count;
+            type_table[type_init_idx].param_types <= type_init_param_types;
+            type_table[type_init_idx].result_types <= type_init_result_types;
+        end
+    end
+
+    // =========================================================================
     // Debug Outputs
     // =========================================================================
     assign dbg_pc = pc;
@@ -592,6 +668,10 @@ module wasm_cpu
             trap_code <= TRAP_NONE;
             result_valid <= 1'b0;
             result_value <= '0;
+            result_count <= 8'h0;
+            for (int i = 0; i < 8; i++) result_values[i] <= '0;
+            capture_result_idx <= 8'h0;
+            capture_result_count <= 8'h0;
             saved_decoded <= '0;
             saved_next_pc <= 32'h0;
             exec_result <= 64'h0;
@@ -696,7 +776,16 @@ module wasm_cpu
                             label_push_en <= 1'b1;
                             label_push_data.target_pc <= 32'h0;  // Will be set when we find END
                             label_push_data.stack_height <= stack_ptr;
-                            label_push_data.arity <= (saved_decoded.immediate == 64'hFFFFFFFF) ? 8'h0 : 8'h1;
+                            // Determine block arity from block type:
+                            // 0xFFFFFFFF (from 0x40) = void (0 results)
+                            // 0x7C-0x7F = single value type (1 result)
+                            // Otherwise = type index, look up in type_table
+                            if (saved_decoded.immediate == 64'hFFFFFFFF)
+                                label_push_data.arity <= 8'h0;
+                            else if (saved_decoded.immediate >= 64'h7C && saved_decoded.immediate <= 64'h7F)
+                                label_push_data.arity <= 8'h1;
+                            else
+                                label_push_data.arity <= type_table[saved_decoded.immediate[7:0]].result_count;
                             label_push_data.is_loop <= 1'b0;
                             pc <= saved_next_pc;
                             state <= STATE_FETCH;
@@ -721,7 +810,13 @@ module wasm_cpu
                                 label_push_en <= 1'b1;
                                 label_push_data.target_pc <= 32'h0;
                                 label_push_data.stack_height <= stack_ptr - 1;
-                                label_push_data.arity <= (saved_decoded.immediate == 64'hFFFFFFFF) ? 8'h0 : 8'h1;
+                                // Determine if block arity from block type
+                                if (saved_decoded.immediate == 64'hFFFFFFFF)
+                                    label_push_data.arity <= 8'h0;
+                                else if (saved_decoded.immediate >= 64'h7C && saved_decoded.immediate <= 64'h7F)
+                                    label_push_data.arity <= 8'h1;
+                                else
+                                    label_push_data.arity <= type_table[saved_decoded.immediate[7:0]].result_count;
                                 label_push_data.is_loop <= 1'b0;
                                 pc <= saved_next_pc;
                                 state <= STATE_FETCH;
@@ -749,14 +844,11 @@ module wasm_cpu
                             if (label_empty || label_stack_ptr == current_frame.label_height) begin
                                 // Function return - don't pop any labels (none belong to this function)
                                 if (current_frame.return_pc == 32'hFFFFFFFF) begin
-                                    // Entry function return - halt
-                                    if (!stack_empty) begin
-                                        result_valid <= 1'b1;
-                                        result_value <= stack_pop_data;
-                                    end
+                                    // Entry function return - capture results then halt
+                                    capture_result_count <= current_frame.arity;
+                                    capture_result_idx <= 8'h0;
                                     frame_pop_en <= 1'b1;  // Pop entry frame
-                                    halted <= 1'b1;
-                                    state <= STATE_HALT;
+                                    state <= STATE_CAPTURE_RESULTS;
                                 end else begin
                                     frame_pop_en <= 1'b1;
                                     pc <= current_frame.return_pc;
@@ -778,7 +870,6 @@ module wasm_cpu
                             logic br_is_func_return;
                             br_func_label_count = label_stack_ptr - current_frame.label_height;
                             br_is_func_return = (saved_decoded.immediate[7:0] >= br_func_label_count);
-
                             if (br_is_func_return) begin
                                 // Branch to function block = return
                                 // Restore label stack to frame's label height
@@ -884,13 +975,11 @@ module wasm_cpu
 
                         OP_RETURN: begin
                             if (current_frame.return_pc == 32'hFFFFFFFF) begin
-                                if (!stack_empty) begin
-                                    result_valid <= 1'b1;
-                                    result_value <= stack_pop_data;
-                                end
+                                // Entry function return - capture results then halt
+                                capture_result_count <= current_frame.arity;
+                                capture_result_idx <= 8'h0;
                                 frame_pop_en <= 1'b1;  // Pop entry frame
-                                halted <= 1'b1;
-                                state <= STATE_HALT;
+                                state <= STATE_CAPTURE_RESULTS;
                             end else begin
                                 frame_pop_en <= 1'b1;
                                 label_set_sp_en <= 1'b1;
@@ -914,6 +1003,63 @@ module wasm_cpu
                                                    func_table[current_frame.func_idx].param_count +
                                                    func_table[current_frame.func_idx].local_count;
                             state <= STATE_CALL;
+                        end
+
+                        OP_CALL_INDIRECT: begin
+                            // Indirect call - operand_a (TOS) is the table index
+                            // saved_decoded.immediate = type_index (expected type)
+                            // saved_decoded.immediate2 = table_index (which table, usually 0)
+                            logic [31:0] table_idx;
+                            logic [15:0] target_func_idx;
+
+                            table_idx = operand_a.value[31:0];
+
+                            // Check if table index is out of bounds
+                            if (table_idx >= {16'b0, elem_table_size}) begin
+                                trapped <= 1'b1;
+                                trap_code <= TRAP_UNDEFINED_ELEMENT;
+                                state <= STATE_TRAP;
+                            end else begin
+                                target_func_idx = elem_table[table_idx[9:0]];
+
+                                // Check if element is uninitialized
+                                if (target_func_idx == 16'hFFFF) begin
+                                    trapped <= 1'b1;
+                                    trap_code <= TRAP_UNINITIALIZED_ELEMENT;
+                                    state <= STATE_TRAP;
+                                end else begin
+                                    // Structural type check: compare full type signatures
+                                    // Expected type from call_indirect instruction
+                                    // Actual type from the target function's type_idx
+                                    automatic type_entry_t expected_type = type_table[saved_decoded.immediate[7:0]];
+                                    automatic type_entry_t actual_type = type_table[func_table[target_func_idx].type_idx[7:0]];
+
+                                    if (expected_type.param_count != actual_type.param_count ||
+                                        expected_type.result_count != actual_type.result_count ||
+                                        expected_type.param_types != actual_type.param_types ||
+                                        expected_type.result_types != actual_type.result_types) begin
+                                        // Type mismatch
+                                        trapped <= 1'b1;
+                                        trap_code <= TRAP_INDIRECT_CALL_TYPE_MISMATCH;
+                                        state <= STATE_TRAP;
+                                    end else begin
+                                        // Pop the table index from stack
+                                        stack_pop_en <= 1'b1;
+
+                                        // Set up the call like OP_CALL does
+                                        call_func_idx <= target_func_idx;
+                                        call_param_count <= func_table[target_func_idx].param_count;
+                                        call_arg_idx <= 8'd0;
+                                        // Add +1 to initial peek offset because the table index pop
+                                        // won't take effect until the next cycle (same cycle as first STATE_CALL)
+                                        call_peek_offset <= {8'b0, func_table[target_func_idx].param_count};
+                                        call_new_local_base <= current_frame.local_base +
+                                                               func_table[current_frame.func_idx].param_count +
+                                                               func_table[current_frame.func_idx].local_count;
+                                        state <= STATE_CALL;
+                                    end
+                                end
+                            end
                         end
 
                         // ==== Parametric Instructions ====
@@ -2044,8 +2190,8 @@ module wasm_cpu
                         8'h44: skip_len = 9;  // f64.const
                         8'h28, 8'h29, 8'h2A, 8'h2B, 8'h2C, 8'h2D, 8'h2E, 8'h2F,
                         8'h30, 8'h31, 8'h32, 8'h33, 8'h34, 8'h35, 8'h36, 8'h37,
-                        8'h38, 8'h39, 8'h3A, 8'h3B, 8'h3C, 8'h3D, 8'h3E, 8'h3F,
-                        8'h40: skip_len = 3;  // memory ops (align + offset)
+                        8'h38, 8'h39, 8'h3A, 8'h3B, 8'h3C, 8'h3D, 8'h3E: skip_len = 3;  // memory ops (align + offset)
+                        8'h3F, 8'h40: skip_len = 2;  // memory.size, memory.grow (single memidx)
                         default: skip_len = 1;  // Simple opcodes
                     endcase
 
@@ -2095,8 +2241,8 @@ module wasm_cpu
                         8'h44: skip_len = 9;
                         8'h28, 8'h29, 8'h2A, 8'h2B, 8'h2C, 8'h2D, 8'h2E, 8'h2F,
                         8'h30, 8'h31, 8'h32, 8'h33, 8'h34, 8'h35, 8'h36, 8'h37,
-                        8'h38, 8'h39, 8'h3A, 8'h3B, 8'h3C, 8'h3D, 8'h3E, 8'h3F,
-                        8'h40: skip_len = 3;
+                        8'h38, 8'h39, 8'h3A, 8'h3B, 8'h3C, 8'h3D, 8'h3E: skip_len = 3;
+                        8'h3F, 8'h40: skip_len = 2;  // memory.size, memory.grow (single memidx)
                         default: skip_len = 1;
                     endcase
 
@@ -2264,16 +2410,20 @@ module wasm_cpu
                         branch_target_arity <= 8'hFF;  // Flag for phase 2
                     end else if (branch_target_arity == 8'hFF) begin
                         // Phase 2: Push the saved value back
-                        stack_push_en <= 1'b1;
-                        stack_push_data <= branch_saved_value;
                         branch_target_arity <= 8'h0;
                         if (is_func_return) begin
-                            // Function return via br
-                            result_valid <= 1'b1;
+                            // Function return via br - set result directly (no stack push needed)
+                            // The value is already saved in branch_saved_value
+                            result_values[0] <= branch_saved_value;
                             result_value <= branch_saved_value;
+                            result_valid <= 1'b1;
+                            result_count <= 8'h1;
                             halted <= 1'b1;
                             state <= STATE_HALT;
                         end else begin
+                            // Non-return branch - push value back to stack
+                            stack_push_en <= 1'b1;
+                            stack_push_data <= branch_saved_value;
                             state <= STATE_FETCH;
                         end
                     end else if (branch_target_arity == 0 && effective_sp > branch_target_stack_height) begin
@@ -2281,27 +2431,52 @@ module wasm_cpu
                         stack_set_sp_en <= 1'b1;
                         stack_set_sp_value <= branch_target_stack_height;
                         if (is_func_return) begin
-                            // Function return via br (void)
-                            halted <= 1'b1;
-                            state <= STATE_HALT;
+                            // Function return via br (void) - no results to capture
+                            capture_result_count <= 8'h0;
+                            capture_result_idx <= 8'h0;
+                            state <= STATE_CAPTURE_RESULTS;
                         end else begin
                             state <= STATE_FETCH;
                         end
                     end else begin
                         // Stack already correct or arity matches excess
                         if (is_func_return) begin
-                            // Function return via br
-                            if (branch_target_arity > 0) begin
-                                result_valid <= 1'b1;
-                                // Use branch_saved_value which was captured before any pops
-                                // (e.g., from br_if which pops condition before reaching here)
-                                result_value <= branch_saved_value;
-                            end
-                            halted <= 1'b1;
-                            state <= STATE_HALT;
+                            // Function return via br - capture results then halt
+                            capture_result_count <= branch_target_arity;
+                            capture_result_idx <= 8'h0;
+                            state <= STATE_CAPTURE_RESULTS;
                         end else begin
                             state <= STATE_FETCH;
                         end
+                    end
+                end
+
+                STATE_CAPTURE_RESULTS: begin
+                    // Capture multi-value results from stack before halting
+                    // Results are on stack: result[0] at bottom, result[N-1] at TOS
+                    // stack_peek_offset is set by combinational logic based on capture_result_idx
+                    // Peek is combinational, so store on same cycle as peek
+                    if (capture_result_count == 0) begin
+                        // No results to capture - just halt
+                        result_valid <= 1'b1;
+                        result_count <= 8'h0;
+                        halted <= 1'b1;
+                        state <= STATE_HALT;
+                    end else if (capture_result_idx < capture_result_count) begin
+                        // Stack peek is happening combinationally based on capture_result_idx
+                        // peek_offset=0 -> TOS -> result[N-1]
+                        // peek_offset=i -> result[N-1-i]
+                        // Store at: result_values[N-1-i] = stack_peek_data
+                        result_values[capture_result_count - 8'd1 - capture_result_idx] <= stack_peek_data;
+                        capture_result_idx <= capture_result_idx + 1;
+                    end else begin
+                        // All results captured, set final outputs and halt
+                        // result_value is for backward compatibility (first result = result[0])
+                        result_value <= result_values[0];
+                        result_valid <= 1'b1;
+                        result_count <= capture_result_count;
+                        halted <= 1'b1;
+                        state <= STATE_HALT;
                     end
                 end
 

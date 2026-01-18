@@ -216,7 +216,7 @@ module wasm_memory
             end
 
             wr_valid <= 1'b0;
-            grow_result <= 32'h0;
+            // Note: grow_result is NOT reset here - it persists until next grow
 
             // Memory grow operation
             if (grow_en) begin

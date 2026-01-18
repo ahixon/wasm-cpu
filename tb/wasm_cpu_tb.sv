@@ -27,6 +27,24 @@ module wasm_cpu_tb;
     logic [15:0] func_wr_idx;
     func_entry_t func_wr_data;
 
+    // Type table interface (not used in simple tests, tied to 0)
+    logic type_init_en = 0;
+    logic [7:0] type_init_idx = 0;
+    logic [7:0] type_init_param_count = 0;
+    logic [7:0] type_init_result_count = 0;
+    logic [31:0] type_init_param_types = 0;
+    logic [31:0] type_init_result_types = 0;
+
+    // Element table interface (not used in simple tests)
+    logic elem_init_en = 0;
+    logic [15:0] elem_init_idx = 0;
+    logic [15:0] elem_init_func_idx = 0;
+
+    // Global, local, memory interfaces (not used in simple tests)
+    logic global_init_en = 0;
+    logic [7:0] global_init_idx = 0;
+    global_entry_t global_init_data;
+
     // Result
     logic result_valid;
     stack_entry_t result_value;
@@ -63,6 +81,18 @@ module wasm_cpu_tb;
         .func_wr_en(func_wr_en),
         .func_wr_idx(func_wr_idx),
         .func_wr_data(func_wr_data),
+        .type_init_en(type_init_en),
+        .type_init_idx(type_init_idx),
+        .type_init_param_count(type_init_param_count),
+        .type_init_result_count(type_init_result_count),
+        .type_init_param_types(type_init_param_types),
+        .type_init_result_types(type_init_result_types),
+        .elem_init_en(elem_init_en),
+        .elem_init_idx(elem_init_idx),
+        .elem_init_func_idx(elem_init_func_idx),
+        .global_init_en(global_init_en),
+        .global_init_idx(global_init_idx),
+        .global_init_data(global_init_data),
         .result_valid(result_valid),
         .result_value(result_value),
         .dbg_pc(dbg_pc),

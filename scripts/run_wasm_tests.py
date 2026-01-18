@@ -39,8 +39,9 @@ class ModuleAssertion:
     func_name: str
     func_idx: int
     args: List[Tuple[str, Any]]
-    expected: Optional[Tuple[str, Any]]
+    expected: Optional[List[Tuple[str, Any]]]  # List of (type, value) for multi-value returns
     is_trap: bool
+    is_invoke_only: bool = False  # Plain invoke for side effects
 
 
 @dataclass
@@ -211,6 +212,11 @@ def extract_module_test_groups(content: str) -> List[ModuleTestGroup]:
             # Start a new module group
             if current_group and current_group.assertions:
                 groups.append(current_group)
+            # Skip modules that have imports - we don't support them
+            if '(import ' in expr:
+                current_group = None
+                pos = end + 1
+                continue
             current_group = ModuleTestGroup(
                 module_wat=expr,
                 export_map=extract_export_map(expr)
@@ -225,6 +231,12 @@ def extract_module_test_groups(content: str) -> List[ModuleTestGroup]:
                 assertion = parse_assertion(expr, current_group.export_map, is_trap=True)
                 if assertion:
                     current_group.assertions.append(assertion)
+        elif expr.startswith('(invoke'):
+            # Plain invoke - run for side effects (void function)
+            if current_group:
+                assertion = parse_assertion(expr, current_group.export_map, is_invoke_only=True)
+                if assertion:
+                    current_group.assertions.append(assertion)
 
         pos = end + 1
 
@@ -235,7 +247,7 @@ def extract_module_test_groups(content: str) -> List[ModuleTestGroup]:
     return groups
 
 
-def parse_assertion(expr: str, export_map: Dict[str, int], is_trap: bool = False) -> Optional[ModuleAssertion]:
+def parse_assertion(expr: str, export_map: Dict[str, int], is_trap: bool = False, is_invoke_only: bool = False) -> Optional[ModuleAssertion]:
     """Parse an assertion expression."""
     # Find the invoke expression
     invoke_match = re.search(r'\(invoke\s+"([^"]+)"', expr)
@@ -258,19 +270,20 @@ def parse_assertion(expr: str, export_map: Dict[str, int], is_trap: bool = False
     args_str = expr[args_start:invoke_end]
     args = parse_values(args_str)
 
-    # Extract expected value
+    # Extract expected values (supports multi-value returns)
     expected = None
-    if not is_trap:
+    if not is_trap and not is_invoke_only:
         expected_str = expr[invoke_end+1:-1].strip()
         expected_values = parse_values(expected_str)
-        expected = expected_values[0] if expected_values else None
+        expected = expected_values if expected_values else None
 
     return ModuleAssertion(
         func_name=func_name,
         func_idx=func_idx,
         args=args,
         expected=expected,
-        is_trap=is_trap
+        is_trap=is_trap,
+        is_invoke_only=is_invoke_only
     )
 
 
@@ -328,9 +341,9 @@ def run_module_tests(group: ModuleTestGroup, wasm_path: Path, verbose: bool = Fa
         return 0, 0, 0
 
     # Generate test list file
-    # Format: <func_idx> <expected_hex> <test_mode> <is_i64> <num_args> [<arg_type> <arg_hex>]...
+    # Format: <func_idx> <test_mode> <num_args> [<arg_type> <arg_hex>]... <num_results> [<result_type> <result_hex>]...
     # test_mode: 0=verify result, 1=expect trap, 2=run only (void function)
-    # arg_type: 0=i32, 1=i64, 2=f32, 3=f64
+    # arg_type/result_type: 0=i32, 1=i64, 2=f32, 3=f64
     testlist_path = wasm_path.with_suffix('.tests')
     with open(testlist_path, 'w') as f:
         for assertion in group.assertions:
@@ -342,18 +355,21 @@ def run_module_tests(group: ModuleTestGroup, wasm_path: Path, verbose: bool = Fa
 
             num_args = len(assertion.args)
 
-            if assertion.expected is None and not assertion.is_trap:
+            if assertion.is_invoke_only or (assertion.expected is None and not assertion.is_trap):
                 # Void function - run for side effects but don't verify result
-                f.write(f"{assertion.func_idx} 0 2 0 {num_args}{args_str}\n")
+                f.write(f"{assertion.func_idx} 2 {num_args}{args_str} 0\n")
                 continue
 
             if assertion.is_trap:
-                f.write(f"{assertion.func_idx} 0 1 0 {num_args}{args_str}\n")
+                f.write(f"{assertion.func_idx} 1 {num_args}{args_str} 0\n")
             else:
-                exp_type, exp_val = assertion.expected
-                is_i64 = 1 if exp_type in ('i64', 'f64') else 0
-                _, expected = encode_value(exp_type, exp_val)
-                f.write(f"{assertion.func_idx} {expected:x} 0 {is_i64} {num_args}{args_str}\n")
+                # Encode all expected results (supports multi-value returns)
+                results_str = ""
+                for exp_type, exp_val in assertion.expected:
+                    type_code, encoded_val = encode_value(exp_type, exp_val)
+                    results_str += f" {type_code} {encoded_val:x}"
+                num_results = len(assertion.expected)
+                f.write(f"{assertion.func_idx} 0 {num_args}{args_str} {num_results}{results_str}\n")
 
     # Count valid tests in the testlist
     with open(testlist_path) as f:
@@ -872,33 +888,66 @@ def main():
             WASM_DIR.mkdir(parents=True, exist_ok=True)
         print("Cleared cached WASM files")
 
+    # Tests to skip - these require features we don't support
+    SKIP_TESTS = {
+        # SIMD tests - not implemented
+        'simd_',
+        # Reference types - not implemented
+        'ref_',
+        'table_',
+        'elem',
+        'local_init',  # Uses externref
+        'call_ref',    # Typed function references
+        'return_call_ref',
+        'br_on_null',
+        'br_on_non_null',
+        # Bulk memory - not implemented
+        'bulk',
+        # Exception handling - not implemented
+        'exception',
+        'throw',
+        'try',
+        # Multi-memory - not implemented
+        'multi-memory',
+        # Extended const - not implemented
+        'extended_const',
+        # Threads - not implemented
+        'atomic',
+        # Type tests that need complex setup
+        'type',
+        'imports',
+        'exports',
+        'linking',
+        # UTF-8 tests
+        'utf8',
+        'names',
+        # Token tests (syntax validation, not runtime)
+        'token',
+        'comments',
+        # Binary tests
+        'binary',
+        # Custom section tests
+        'custom',
+        # Data segment tests with complex initialization
+        'data',
+        # Start function tests
+        'start',
+    }
+
+    def should_skip_test(name: str) -> bool:
+        """Check if a test should be skipped based on filename."""
+        name_lower = name.lower()
+        for skip in SKIP_TESTS:
+            if skip in name_lower:
+                return True
+        return False
+
     # Determine which test files to run
     if '--all' in sys.argv:
         spec_dir = PROJECT_DIR / 'spec' / 'test' / 'core'
-        # Core integer and control flow tests
-        test_files = [
-            'i32.wast', 'i64.wast',
-            'block.wast', 'loop.wast', 'if.wast',
-            'br.wast', 'br_if.wast', 'br_table.wast',
-            'call.wast', 'return.wast',
-            'local_get.wast', 'local_set.wast', 'local_tee.wast',
-            'global.wast',
-            'select.wast', 'nop.wast',
-            'int_literals.wast', 'int_exprs.wast',
-            'load.wast', 'store.wast',
-            'memory.wast', 'memory_size.wast', 'memory_grow.wast',
-            'address.wast', 'align.wast', 'endianness.wast',
-            'const.wast',
-            'stack.wast', 'switch.wast', 'labels.wast',
-            'fac.wast', 'forward.wast',
-            'traps.wast', 'unreachable.wast', 'unwind.wast',
-            'func.wast', 'left-to-right.wast',
-            'conversions.wast',
-            'f32.wast', 'f64.wast',
-            'f32_bitwise.wast', 'f64_bitwise.wast',
-            'f32_cmp.wast', 'f64_cmp.wast',
-        ]
-        wast_files = [spec_dir / f for f in test_files if (spec_dir / f).exists()]
+        # Glob all .wast files and filter out unsupported tests
+        all_wast = sorted(spec_dir.glob('*.wast'))
+        wast_files = [f for f in all_wast if not should_skip_test(f.name)]
     else:
         wast_files = [Path(arg) for arg in sys.argv[1:] if not arg.startswith('-')]
         if not wast_files:

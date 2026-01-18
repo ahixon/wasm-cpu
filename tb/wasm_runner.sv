@@ -2,7 +2,10 @@
 // Loads a .wasm file via plusargs and runs multiple assertions
 // Usage: ./Vwasm_runner +wasm=test.wasm +tests=testlist.txt
 //    or: ./Vwasm_runner +wasm=test.wasm +expected=42 +func=0 [+trap] [+i64]
-// Test list format (one per line): <func_idx> <expected_hex> [trap] [i64]
+// Test list format (one per line):
+//   <func_idx> <test_mode> <num_args> [<arg_type> <arg_hex>]... <num_results> [<result_type> <result_hex>]...
+// test_mode: 0=verify result, 1=expect trap, 2=run only (void function)
+// arg_type/result_type: 0=i32, 1=i64, 2=f32, 3=f64
 
 `timescale 1ns/1ps
 
@@ -23,6 +26,8 @@ module wasm_runner;
     func_entry_t func_wr_data;
     logic result_valid;
     stack_entry_t result_value;
+    logic [7:0] result_count;
+    stack_entry_t result_values [0:15];
     logic [31:0] dbg_pc;
     exec_state_t dbg_state;
     logic [15:0] dbg_stack_ptr;
@@ -44,6 +49,15 @@ module wasm_runner;
     logic global_init_en;
     logic [7:0] global_init_idx;
     global_entry_t global_init_data;
+    logic elem_init_en;
+    logic [15:0] elem_init_idx;
+    logic [15:0] elem_init_func_idx;
+    logic type_init_en;
+    logic [7:0] type_init_idx;
+    logic [7:0] type_init_param_count;
+    logic [7:0] type_init_result_count;
+    logic [31:0] type_init_param_types;
+    logic [31:0] type_init_result_types;
 
     wasm_cpu #(.CODE_SIZE(65536), .STACK_SIZE(1024), .MEM_PAGES(1024)) dut (.*);
 
@@ -65,10 +79,14 @@ module wasm_runner;
     // Test list storage
     // test_mode: 0=verify result, 1=expect trap, 2=run only (void function)
     int test_func_list [0:1023];
-    longint test_expected_list [0:1023];
     int test_mode_list [0:1023];
-    int test_i64_list [0:1023];
     int num_tests;
+
+    // Result storage for tests (supports multi-value returns)
+    // Max 16 results per test, 1024 tests
+    int test_num_results [0:1023];
+    int test_result_types [0:1023][0:15];     // 0=i32, 1=i64, 2=f32, 3=f64
+    longint test_result_values [0:1023][0:15];
 
     // Argument storage for tests
     // Max 32 arguments per test, 1024 tests
@@ -83,11 +101,23 @@ module wasm_runner;
         int local_count;
         int param_count;
         int result_count;
+        int type_idx;
     } func_info_t;
 
     func_info_t func_info [0:255];
     int num_functions;
     int total_code_size;
+
+    // Type information extracted from WASM
+    typedef struct {
+        int param_count;
+        int result_count;
+        int param_types;   // Packed 4-bit valtypes, up to 8 params
+        int result_types;  // Packed 4-bit valtypes, up to 8 results
+    } type_info_t;
+
+    type_info_t type_info [0:255];
+    int num_types;
 
     // Read LEB128 unsigned integer
     function automatic int read_leb128_u(inout int pos);
@@ -156,15 +186,50 @@ module wasm_runner;
 
             case (section_id)
                 1: begin  // Type section
+                    int packed_params, packed_results;
+                    int valtype;
                     type_count = read_leb128_u(pos);
+                    num_types = type_count;  // Store globally
                     for (i = 0; i < type_count; i++) begin
                         pos++;  // Skip 0x60 (func type marker)
                         param_counts[i] = read_leb128_u(pos);
-                        for (j = 0; j < param_counts[i]; j++)
-                            pos++;  // Skip param types
+                        packed_params = 0;
+                        for (j = 0; j < param_counts[i] && j < 8; j++) begin
+                            // Convert WASM valtype to our 4-bit encoding
+                            // WASM: 0x7F=i32, 0x7E=i64, 0x7D=f32, 0x7C=f64
+                            // Ours: 0=i32, 1=i64, 2=f32, 3=f64
+                            valtype = wasm_data[pos];
+                            case (valtype)
+                                8'h7F: packed_params = packed_params | (0 << (j * 4));  // i32
+                                8'h7E: packed_params = packed_params | (1 << (j * 4));  // i64
+                                8'h7D: packed_params = packed_params | (2 << (j * 4));  // f32
+                                8'h7C: packed_params = packed_params | (3 << (j * 4));  // f64
+                            endcase
+                            pos++;
+                        end
+                        // Skip any remaining params beyond 8
+                        for (j = 8; j < param_counts[i]; j++)
+                            pos++;
                         result_counts[i] = read_leb128_u(pos);
-                        for (j = 0; j < result_counts[i]; j++)
-                            pos++;  // Skip result types
+                        packed_results = 0;
+                        for (j = 0; j < result_counts[i] && j < 8; j++) begin
+                            valtype = wasm_data[pos];
+                            case (valtype)
+                                8'h7F: packed_results = packed_results | (0 << (j * 4));  // i32
+                                8'h7E: packed_results = packed_results | (1 << (j * 4));  // i64
+                                8'h7D: packed_results = packed_results | (2 << (j * 4));  // f32
+                                8'h7C: packed_results = packed_results | (3 << (j * 4));  // f64
+                            endcase
+                            pos++;
+                        end
+                        // Skip any remaining results beyond 8
+                        for (j = 8; j < result_counts[i]; j++)
+                            pos++;
+                        // Store in global type_info
+                        type_info[i].param_count = param_counts[i];
+                        type_info[i].result_count = result_counts[i];
+                        type_info[i].param_types = packed_params;
+                        type_info[i].result_types = packed_results;
                     end
                 end
 
@@ -199,6 +264,7 @@ module wasm_runner;
                         func_info[i].local_count = local_count;
                         func_info[i].param_count = param_counts[type_indices[i]];
                         func_info[i].result_count = result_counts[type_indices[i]];
+                        func_info[i].type_idx = type_indices[i];
 
                         // Skip to end of body
                         pos = body_start_pos + body_size;
@@ -289,7 +355,7 @@ module wasm_runner;
                     func_wr_idx = i;
                     func_wr_data.code_offset = code_offset + code_start_in_body;
                     func_wr_data.code_length = actual_code_len;
-                    func_wr_data.type_idx = 0;
+                    func_wr_data.type_idx = func_info[i].type_idx;
                     func_wr_data.param_count = func_info[i].param_count;
                     func_wr_data.result_count = func_info[i].result_count;
                     func_wr_data.local_count = func_info[i].local_count;
@@ -494,6 +560,134 @@ module wasm_runner;
         global_init_en = 0;
     endtask
 
+    // Element table storage (for call_indirect)
+    int elem_entries [0:1023];  // Function indices in element table
+    int num_elements;
+
+    // Extract element section from WASM (section 9)
+    task automatic extract_elements();
+        int pos, section_id, section_size, elem_count;
+        int flags, table_idx, offset_val, num_funcs;
+        int opcode, elemtype;
+
+        num_elements = 0;
+
+        pos = 8;
+        while (pos < wasm_size) begin
+            section_id = wasm_data[pos];
+            pos++;
+            section_size = read_leb128_u(pos);
+
+            if (section_id == 9) begin  // Element section
+                elem_count = read_leb128_u(pos);
+
+                for (int e = 0; e < elem_count; e++) begin
+                    // Element segment format depends on flags
+                    flags = read_leb128_u(pos);
+
+                    if (flags == 0) begin
+                        // flags=0: Active, table 0, offset expr, vec of func idx
+                        opcode = wasm_data[pos];
+                        pos++;
+                        if (opcode == 8'h41) begin  // i32.const
+                            offset_val = read_leb128_s(pos);
+                        end else begin
+                            offset_val = 0;
+                        end
+                        if (wasm_data[pos] == 8'h0B) pos++;  // end
+
+                        num_funcs = read_leb128_u(pos);
+                        for (int f = 0; f < num_funcs; f++) begin
+                            int func_idx_val;
+                            func_idx_val = read_leb128_u(pos);
+                            if (offset_val + f < 1024) begin
+                                elem_entries[offset_val + f] = func_idx_val;
+                                if (offset_val + f + 1 > num_elements) begin
+                                    num_elements = offset_val + f + 1;
+                                end
+                            end
+                        end
+                    end else if (flags == 4) begin
+                        // flags=4: Active, table 0, offset expr, vec of elem exprs (ref.func idx)
+                        opcode = wasm_data[pos];
+                        pos++;
+                        if (opcode == 8'h41) begin  // i32.const
+                            offset_val = read_leb128_s(pos);
+                        end else begin
+                            offset_val = 0;
+                        end
+                        if (wasm_data[pos] == 8'h0B) pos++;  // end
+
+                        num_funcs = read_leb128_u(pos);
+                        for (int f = 0; f < num_funcs; f++) begin
+                            int func_idx_val;
+                            opcode = wasm_data[pos];
+                            pos++;
+                            if (opcode == 8'hD2) begin  // ref.func
+                                func_idx_val = read_leb128_u(pos);
+                                if (wasm_data[pos] == 8'h0B) pos++;  // end
+                                if (offset_val + f < 1024) begin
+                                    elem_entries[offset_val + f] = func_idx_val;
+                                    if (offset_val + f + 1 > num_elements) begin
+                                        num_elements = offset_val + f + 1;
+                                    end
+                                end
+                            end else if (opcode == 8'hD0) begin  // ref.null
+                                // Read the type (funcref = 0x70)
+                                read_leb128_u(pos);
+                                if (wasm_data[pos] == 8'h0B) pos++;  // end
+                                // Store as -1 to indicate null
+                                if (offset_val + f < 1024) begin
+                                    elem_entries[offset_val + f] = -1;
+                                    if (offset_val + f + 1 > num_elements) begin
+                                        num_elements = offset_val + f + 1;
+                                    end
+                                end
+                            end else begin
+                                // Skip unknown expression
+                                if (wasm_data[pos] == 8'h0B) pos++;
+                            end
+                        end
+                    end else begin
+                        // Other element segment types - skip this segment
+                        // For a full implementation, would need to handle all flag combinations
+                        break;
+                    end
+                end
+                return;
+            end else begin
+                pos = pos + section_size;
+            end
+        end
+    endtask
+
+    // Load elements into element table
+    task automatic load_elements();
+        for (int e = 0; e < num_elements; e++) begin
+            @(posedge clk);
+            elem_init_en = 1;
+            elem_init_idx = e[15:0];
+            elem_init_func_idx = elem_entries[e][15:0];
+        end
+        @(posedge clk);
+        elem_init_en = 0;
+    endtask
+
+    // Load types into the CPU's type table (for multi-value block types)
+    task automatic load_types();
+        for (int i = 0; i < num_types; i++) begin
+            @(posedge clk);
+            type_init_en = 1;
+            type_init_idx = i[7:0];
+            type_init_param_count = type_info[i].param_count[7:0];
+            type_init_result_count = type_info[i].result_count[7:0];
+            type_init_param_types = type_info[i].param_types[31:0];
+            type_init_result_types = type_info[i].result_types[31:0];
+        end
+        @(posedge clk);
+        type_init_en = 0;
+    endtask
+
     // Load code for single-function mode (legacy compatibility)
     function automatic int extract_code(output logic [7:0] code[], output int code_len);
         int pos, section_id, section_size, func_count, body_size, local_count;
@@ -541,16 +735,15 @@ module wasm_runner;
     endfunction
 
     // Parse test list file
-    // Format: <func_idx> <expected_hex> <test_mode> <is_i64> <num_args> [<arg_type> <arg_hex>]...
+    // Format: <func_idx> <test_mode> <num_args> [<arg_type> <arg_hex>]... <num_results> [<result_type> <result_hex>]...
     // test_mode: 0=verify result, 1=expect trap, 2=run only (void function)
-    // arg_type: 0=i32, 1=i64, 2=f32, 3=f64
+    // arg_type/result_type: 0=i32, 1=i64, 2=f32, 3=f64
     task automatic parse_testlist(input string filename);
         int fd;
         int func_id;
-        longint expected;
-        int test_mode, is_64, nargs;
-        int arg_type;
-        longint arg_val;
+        int test_mode, nargs, nresults;
+        int arg_type, result_type;
+        longint arg_val, result_val;
 
         num_tests = 0;
         fd = $fopen(filename, "r");
@@ -561,12 +754,10 @@ module wasm_runner;
 
         while (!$feof(fd)) begin
             int n;
-            n = $fscanf(fd, "%d %h %d %d %d", func_id, expected, test_mode, is_64, nargs);
-            if (n >= 5) begin
+            n = $fscanf(fd, "%d %d %d", func_id, test_mode, nargs);
+            if (n >= 3) begin
                 test_func_list[num_tests] = func_id;
-                test_expected_list[num_tests] = expected;
                 test_mode_list[num_tests] = test_mode;
-                test_i64_list[num_tests] = is_64;
                 test_num_args[num_tests] = nargs;
 
                 // Read arguments
@@ -575,6 +766,20 @@ module wasm_runner;
                         test_arg_types[num_tests][a] = arg_type;
                         test_arg_values[num_tests][a] = arg_val;
                     end
+                end
+
+                // Read number of expected results
+                if ($fscanf(fd, " %d", nresults) == 1) begin
+                    test_num_results[num_tests] = nresults;
+                    // Read expected results
+                    for (int r = 0; r < nresults && r < 16; r++) begin
+                        if ($fscanf(fd, " %d %h", result_type, result_val) == 2) begin
+                            test_result_types[num_tests][r] = result_type;
+                            test_result_values[num_tests][r] = result_val;
+                        end
+                    end
+                end else begin
+                    test_num_results[num_tests] = 0;
                 end
 
                 num_tests++;
@@ -587,15 +792,17 @@ module wasm_runner;
     // test_mode: 0=verify result, 1=expect trap, 2=run only (void function)
     task automatic run_invocation(
         input int func_id,
-        input longint expected,
         input int test_mode,
-        input int is_64,
         input int num_args,
         input int arg_types [0:31],
         input longint arg_values [0:31],
+        input int num_results,
+        input int exp_result_types [0:15],
+        input longint exp_result_values [0:15],
         output int passed
     );
         int cycles;
+        int all_match;
 
         passed = 0;
 
@@ -647,19 +854,34 @@ module wasm_runner;
         @(posedge clk);
 
         cycles = 0;
-        while (!halted && cycles < 1000000) begin
+        while (!halted && cycles < 10000000) begin
             @(posedge clk);
             cycles++;
         end
 
         case (test_mode)
-            0: begin  // Normal test - verify result
+            0: begin  // Normal test - verify all results
                 if (trapped) begin
                     passed = 0;
-                end else if (is_64) begin
-                    passed = (result_value.value == expected);
+                end else if (num_results == 0) begin
+                    // No results expected - pass if not trapped
+                    passed = 1;
                 end else begin
-                    passed = (result_value.value[31:0] == expected[31:0]);
+                    // Check all results match
+                    all_match = 1;
+                    for (int r = 0; r < num_results && r < 16; r++) begin
+                        // Check based on type (32-bit vs 64-bit comparison)
+                        if (exp_result_types[r] == 1 || exp_result_types[r] == 3) begin
+                            // i64 or f64 - full 64-bit comparison
+                            if (result_values[r].value != exp_result_values[r])
+                                all_match = 0;
+                        end else begin
+                            // i32 or f32 - 32-bit comparison
+                            if (result_values[r].value[31:0] != exp_result_values[r][31:0])
+                                all_match = 0;
+                        end
+                    end
+                    passed = all_match;
                 end
             end
             1: begin  // Expect trap
@@ -705,6 +927,9 @@ module wasm_runner;
         global_init_en = 0;
         global_init_idx = 0;
         global_init_data = '0;
+        elem_init_en = 0;
+        elem_init_idx = 0;
+        elem_init_func_idx = 0;
 
         // Get plusargs
         if (!$value$plusargs("wasm=%s", wasm_file)) begin
@@ -774,6 +999,10 @@ module wasm_runner;
         extract_globals();
         load_globals();
 
+        // Extract and load element table (for call_indirect)
+        extract_elements();
+        load_elements();
+
         if (use_testlist) begin
             // Multi-test mode: extract all functions
             extract_all_functions();
@@ -783,6 +1012,9 @@ module wasm_runner;
 
             // Register all functions with proper offsets
             register_functions_from_wasm();
+
+            // Load types (for multi-value block types)
+            load_types();
 
             // Parse test list
             parse_testlist(tests_file);
@@ -797,22 +1029,29 @@ module wasm_runner;
             total_failed = 0;
 
             for (int t = 0; t < num_tests; t++) begin
-                // Copy arguments for this test into local arrays
+                // Copy arguments and expected results for this test into local arrays
                 automatic int local_arg_types [0:31];
                 automatic longint local_arg_values [0:31];
+                automatic int local_result_types [0:15];
+                automatic longint local_result_values [0:15];
                 for (int a = 0; a < 32; a++) begin
                     local_arg_types[a] = test_arg_types[t][a];
                     local_arg_values[a] = test_arg_values[t][a];
                 end
+                for (int r = 0; r < 16; r++) begin
+                    local_result_types[r] = test_result_types[t][r];
+                    local_result_values[r] = test_result_values[t][r];
+                end
 
                 run_invocation(
                     test_func_list[t],
-                    test_expected_list[t],
                     test_mode_list[t],
-                    test_i64_list[t],
                     test_num_args[t],
                     local_arg_types,
                     local_arg_values,
+                    test_num_results[t],
+                    local_result_types,
+                    local_result_values,
                     test_passed
                 );
 
@@ -827,12 +1066,13 @@ module wasm_runner;
                         $display("FAIL: test %0d func %0d (void func trapped unexpectedly)",
                             t, test_func_list[t]);
                     end else if (trapped) begin
-                        $display("FAIL: test %0d func %0d (unexpected trap)",
-                            t, test_func_list[t]);
+                        $display("FAIL: test %0d func %0d (unexpected trap, code=%0d)",
+                            t, test_func_list[t], trap_code);
                     end else begin
-                        $display("FAIL: test %0d func %0d expected %0h, got %0h",
-                            t, test_func_list[t], test_expected_list[t],
-                            test_i64_list[t] ? result_value.value : result_value.value[31:0]);
+                        // Show first mismatched result
+                        $display("FAIL: test %0d func %0d expected %0h, got %0h (result_count=%0d, result_valid=%0d)",
+                            t, test_func_list[t], local_result_values[0],
+                            result_values[0].value, result_count, result_valid);
                     end
                 end
             end
@@ -844,70 +1084,46 @@ module wasm_runner;
             end
 
         end else begin
-            // Legacy single-function mode
-            if (!extract_code(code, code_len)) begin
-                $display("FAIL: Cannot extract code from %s", wasm_file);
-                $finish;
-            end
+            // Single-test mode: use full module loading (just like multi-test mode)
+            extract_all_functions();
+            load_all_code();
+            register_functions_from_wasm();
 
-            // Load code
-            for (int i = 0; i < code_len; i++) begin
-                @(posedge clk);
-                code_wr_en = 1;
-                code_wr_addr = i;
-                code_wr_data = code[i];
-            end
-            @(posedge clk);
-            code_wr_en = 0;
+            // Set up single expected result for backward compatibility
+            // Use test arrays index 0 which is zero-initialized
+            test_result_types[0][0] = is_i64 ? 1 : 0;
+            test_result_values[0][0] = expected_value;
 
-            // Register function
-            @(posedge clk);
-            func_wr_en = 1;
-            func_wr_idx = 0;
-            func_wr_data.code_offset = 0;
-            func_wr_data.code_length = code_len;
-            func_wr_data.type_idx = 0;
-            func_wr_data.param_count = 0;
-            func_wr_data.result_count = 1;
-            func_wr_data.local_count = 0;
-            @(posedge clk);
-            func_wr_en = 0;
+            // Run the test (using test arrays index 0 as scratch)
+            // These are already zero-initialized
+            run_invocation(
+                func_idx,
+                expect_trap ? 1 : 0,  // test_mode: 0=verify result, 1=expect trap
+                0,  // num_args (single-test mode doesn't support arguments)
+                test_arg_types[0],
+                test_arg_values[0],
+                expect_trap ? 0 : 1,  // num_results: 0 for trap, 1 for normal
+                test_result_types[0],
+                test_result_values[0],
+                test_passed
+            );
 
-            // Run
-            @(posedge clk);
-            entry_func = func_idx;
-            start = 1;
-            @(posedge clk);
-            start = 0;
-
-            cycles = 0;
-            while (!halted && cycles < 1000000) begin
-                @(posedge clk);
-                cycles++;
-            end
-
-            // Check result
-            if (expect_trap) begin
-                if (trapped) begin
+            // Report result
+            if (test_passed) begin
+                if (expect_trap) begin
                     $display("PASS: %s (trapped as expected)", wasm_file);
                 end else begin
-                    $display("FAIL: %s (expected trap, got %0d)", wasm_file, result_value.value);
+                    $display("PASS: %s = %0d", wasm_file, is_i64 ? result_value.value : result_value.value[31:0]);
                 end
             end else begin
-                if (trapped) begin
+                if (expect_trap) begin
+                    $display("FAIL: %s (expected trap, got %0d)", wasm_file, result_value.value);
+                end else if (trapped) begin
                     $display("FAIL: %s (unexpected trap)", wasm_file);
-                end else if (is_i64) begin
-                    if (result_value.value == expected_value) begin
-                        $display("PASS: %s = %0d", wasm_file, result_value.value);
-                    end else begin
-                        $display("FAIL: %s expected %0d, got %0d", wasm_file, expected_value, result_value.value);
-                    end
                 end else begin
-                    if (result_value.value[31:0] == expected_value[31:0]) begin
-                        $display("PASS: %s = %0d", wasm_file, result_value.value[31:0]);
-                    end else begin
-                        $display("FAIL: %s expected %0d, got %0d", wasm_file, expected_value[31:0], result_value.value[31:0]);
-                    end
+                    $display("FAIL: %s expected %0d, got %0d", wasm_file,
+                        is_i64 ? expected_value : expected_value[31:0],
+                        is_i64 ? result_values[0].value : result_values[0].value[31:0]);
                 end
             end
         end

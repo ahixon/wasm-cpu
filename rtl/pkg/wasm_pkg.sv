@@ -340,6 +340,7 @@ package wasm_pkg;
         STATE_SCAN_BR_TABLE, // Scanning br_table during end scan
         STATE_BR_TABLE,      // Processing br_table targets
         STATE_BR_UNWIND,     // Unwinding stack after branch
+        STATE_CAPTURE_RESULTS, // Capturing multi-value results before halt
         STATE_TRAP,
         STATE_HALT
     } exec_state_t;
