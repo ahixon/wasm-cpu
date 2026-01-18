@@ -99,10 +99,29 @@ module wasm_cpu
     output logic [31:0] import_arg2_o,            // Import argument 2
     output logic [31:0] import_arg3_o,            // Import argument 3
 
-    // Debug memory read interface (active when halted)
+    // Debug memory read interface (directly to memory, active when halted)
     input  logic        dbg_mem_rd_en,
     input  logic [31:0] dbg_mem_rd_addr,
-    output logic [31:0] dbg_mem_rd_data
+    output logic [31:0] dbg_mem_rd_data,
+
+    // External memory interface (memory module is instantiated outside CPU)
+    // CPU -> Memory (outputs)
+    output logic        mem_rd_en_o,
+    output logic [31:0] mem_rd_addr_o,
+    output mem_op_t     mem_rd_op_o,
+    output logic        mem_wr_en_o,
+    output logic [31:0] mem_wr_addr_o,
+    output mem_op_t     mem_wr_op_o,
+    output logic [63:0] mem_wr_data_o,
+    output logic        mem_grow_en_o,
+    output logic [31:0] mem_grow_pages_o,
+    // Memory -> CPU (inputs)
+    input  logic [63:0] mem_rd_data_i,
+    input  logic        mem_rd_valid_i,
+    input  logic        mem_wr_valid_i,
+    input  logic [31:0] mem_current_pages_i,
+    input  logic [31:0] mem_grow_result_i,
+    input  trap_t       mem_trap_i
 );
 
     // =========================================================================
@@ -360,8 +379,9 @@ module wasm_cpu
     );
 
     // =========================================================================
-    // Linear Memory
+    // Linear Memory Interface (memory module instantiated externally)
     // =========================================================================
+    // Internal signals that drive/receive the external memory interface
     logic        mem_rd_en;
     logic [31:0] mem_rd_addr;
     mem_op_t     mem_rd_op;
@@ -378,34 +398,23 @@ module wasm_cpu
     logic [31:0] mem_grow_result;
     trap_t       mem_trap;
 
-    wasm_memory #(.MAX_PAGES(MEM_PAGES)) linear_memory (
-        .clk(clk),
-        .rst_n(rst_n),
-        .init_en(mem_init_en),
-        .init_pages(mem_init_pages),
-        .init_max_pages(mem_init_max_pages),
-        .data_wr_en(mem_data_wr_en),
-        .data_wr_addr(mem_data_wr_addr),
-        .data_wr_data(mem_data_wr_data),
-        .rd_en(mem_rd_en),
-        .rd_addr(mem_rd_addr),
-        .rd_op(mem_rd_op),
-        .rd_data(mem_rd_data),
-        .rd_valid(mem_rd_valid),
-        .wr_en(mem_wr_en),
-        .wr_addr(mem_wr_addr),
-        .wr_op(mem_wr_op),
-        .wr_data(mem_wr_data),
-        .wr_valid(mem_wr_valid),
-        .grow_en(mem_grow_en),
-        .grow_pages(mem_grow_pages),
-        .current_pages(mem_current_pages),
-        .grow_result(mem_grow_result),
-        .trap(mem_trap),
-        .dbg_rd_en(dbg_mem_rd_en),
-        .dbg_rd_addr(dbg_mem_rd_addr),
-        .dbg_rd_data(dbg_mem_rd_data)
-    );
+    // Connect internal signals to external memory interface ports
+    assign mem_rd_en_o = mem_rd_en;
+    assign mem_rd_addr_o = mem_rd_addr;
+    assign mem_rd_op_o = mem_rd_op;
+    assign mem_wr_en_o = mem_wr_en;
+    assign mem_wr_addr_o = mem_wr_addr;
+    assign mem_wr_op_o = mem_wr_op;
+    assign mem_wr_data_o = mem_wr_data;
+    assign mem_grow_en_o = mem_grow_en;
+    assign mem_grow_pages_o = mem_grow_pages;
+
+    assign mem_rd_data = mem_rd_data_i;
+    assign mem_rd_valid = mem_rd_valid_i;
+    assign mem_wr_valid = mem_wr_valid_i;
+    assign mem_current_pages = mem_current_pages_i;
+    assign mem_grow_result = mem_grow_result_i;
+    assign mem_trap = mem_trap_i;
 
     // =========================================================================
     // Local Variables

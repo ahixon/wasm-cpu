@@ -60,7 +60,75 @@ module wasm_runner;
     logic [31:0] type_init_param_types;
     logic [31:0] type_init_result_types;
 
+    // External halt/resume interface (for SoC integration, unused in standalone tests)
+    logic ext_halt_i = 0;
+    logic ext_resume_i = 0;
+    logic [31:0] ext_resume_pc_i = 0;
+    logic [31:0] ext_resume_val_i = 0;
+    logic ext_halted_o;
+
+    // Import trap information
+    logic [15:0] import_id_o;
+    logic [31:0] import_arg0_o;
+    logic [31:0] import_arg1_o;
+    logic [31:0] import_arg2_o;
+    logic [31:0] import_arg3_o;
+
+    // Debug memory read interface
+    logic dbg_mem_rd_en = 0;
+    logic [31:0] dbg_mem_rd_addr = 0;
+    logic [31:0] dbg_mem_rd_data;
+
+    // CPU -> Memory interface
+    logic mem_rd_en_o;
+    logic [31:0] mem_rd_addr_o;
+    mem_op_t mem_rd_op_o;
+    logic mem_wr_en_o;
+    logic [31:0] mem_wr_addr_o;
+    mem_op_t mem_wr_op_o;
+    logic [63:0] mem_wr_data_o;
+    logic mem_grow_en_o;
+    logic [31:0] mem_grow_pages_o;
+
+    // Memory -> CPU interface
+    logic [63:0] mem_rd_data_i;
+    logic mem_rd_valid_i;
+    logic mem_wr_valid_i;
+    logic [31:0] mem_current_pages_i;
+    logic [31:0] mem_grow_result_i;
+    trap_t mem_trap_i;
+
     wasm_cpu #(.CODE_SIZE(65536), .STACK_SIZE(1024), .MEM_PAGES(1024)) dut (.*);
+
+    // Linear Memory
+    wasm_memory #(.MAX_PAGES(1024)) linear_memory (
+        .clk(clk),
+        .rst_n(rst_n),
+        .init_en(mem_init_en),
+        .init_pages(mem_init_pages),
+        .init_max_pages(mem_init_max_pages),
+        .data_wr_en(mem_data_wr_en),
+        .data_wr_addr(mem_data_wr_addr),
+        .data_wr_data(mem_data_wr_data),
+        .rd_en(mem_rd_en_o),
+        .rd_addr(mem_rd_addr_o),
+        .rd_op(mem_rd_op_o),
+        .rd_data(mem_rd_data_i),
+        .rd_valid(mem_rd_valid_i),
+        .wr_en(mem_wr_en_o),
+        .wr_addr(mem_wr_addr_o),
+        .wr_op(mem_wr_op_o),
+        .wr_data(mem_wr_data_o),
+        .wr_valid(mem_wr_valid_i),
+        .grow_en(mem_grow_en_o),
+        .grow_pages(mem_grow_pages_o),
+        .current_pages(mem_current_pages_i),
+        .grow_result(mem_grow_result_i),
+        .trap(mem_trap_i),
+        .dbg_rd_en(dbg_mem_rd_en),
+        .dbg_rd_addr(dbg_mem_rd_addr),
+        .dbg_rd_data(dbg_mem_rd_data)
+    );
 
     always #5 clk = ~clk;
 

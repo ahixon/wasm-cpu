@@ -45,6 +45,36 @@ module wasm_cpu_tb;
     logic [7:0] global_init_idx = 0;
     global_entry_t global_init_data;
 
+    // Memory interface signals (directly to memory module)
+    logic mem_init_en = 0;
+    logic [31:0] mem_init_pages = 1;
+    logic [31:0] mem_init_max_pages = 16;
+    logic mem_data_wr_en = 0;
+    logic [31:0] mem_data_wr_addr = 0;
+    logic [7:0] mem_data_wr_data = 0;
+    logic dbg_mem_rd_en = 0;
+    logic [31:0] dbg_mem_rd_addr = 0;
+    logic [31:0] dbg_mem_rd_data;
+
+    // CPU -> Memory interface
+    logic mem_rd_en;
+    logic [31:0] mem_rd_addr;
+    mem_op_t mem_rd_op;
+    logic mem_wr_en;
+    logic [31:0] mem_wr_addr;
+    mem_op_t mem_wr_op;
+    logic [63:0] mem_wr_data;
+    logic mem_grow_en;
+    logic [31:0] mem_grow_pages;
+
+    // Memory -> CPU interface
+    logic [63:0] mem_rd_data;
+    logic mem_rd_valid;
+    logic mem_wr_valid;
+    logic [31:0] mem_current_pages;
+    logic [31:0] mem_grow_result;
+    trap_t mem_trap;
+
     // Result
     logic result_valid;
     stack_entry_t result_value;
@@ -81,6 +111,12 @@ module wasm_cpu_tb;
         .func_wr_en(func_wr_en),
         .func_wr_idx(func_wr_idx),
         .func_wr_data(func_wr_data),
+        .mem_init_en(mem_init_en),
+        .mem_init_pages(mem_init_pages),
+        .mem_init_max_pages(mem_init_max_pages),
+        .mem_data_wr_en(mem_data_wr_en),
+        .mem_data_wr_addr(mem_data_wr_addr),
+        .mem_data_wr_data(mem_data_wr_data),
         .type_init_en(type_init_en),
         .type_init_idx(type_init_idx),
         .type_init_param_count(type_init_param_count),
@@ -100,7 +136,56 @@ module wasm_cpu_tb;
         .dbg_stack_ptr(dbg_stack_ptr),
         .dbg_saved_next_pc(dbg_saved_next_pc),
         .dbg_decode_next_pc(dbg_decode_next_pc),
-        .dbg_instr_len(dbg_instr_len)
+        .dbg_instr_len(dbg_instr_len),
+        .dbg_mem_rd_en(dbg_mem_rd_en),
+        .dbg_mem_rd_addr(dbg_mem_rd_addr),
+        .dbg_mem_rd_data(dbg_mem_rd_data),
+        // Memory interface
+        .mem_rd_en_o(mem_rd_en),
+        .mem_rd_addr_o(mem_rd_addr),
+        .mem_rd_op_o(mem_rd_op),
+        .mem_wr_en_o(mem_wr_en),
+        .mem_wr_addr_o(mem_wr_addr),
+        .mem_wr_op_o(mem_wr_op),
+        .mem_wr_data_o(mem_wr_data),
+        .mem_grow_en_o(mem_grow_en),
+        .mem_grow_pages_o(mem_grow_pages),
+        .mem_rd_data_i(mem_rd_data),
+        .mem_rd_valid_i(mem_rd_valid),
+        .mem_wr_valid_i(mem_wr_valid),
+        .mem_current_pages_i(mem_current_pages),
+        .mem_grow_result_i(mem_grow_result),
+        .mem_trap_i(mem_trap)
+    );
+
+    // Linear Memory
+    wasm_memory #(.MAX_PAGES(16)) linear_memory (
+        .clk(clk),
+        .rst_n(rst_n),
+        .init_en(mem_init_en),
+        .init_pages(mem_init_pages),
+        .init_max_pages(mem_init_max_pages),
+        .data_wr_en(mem_data_wr_en),
+        .data_wr_addr(mem_data_wr_addr),
+        .data_wr_data(mem_data_wr_data),
+        .rd_en(mem_rd_en),
+        .rd_addr(mem_rd_addr),
+        .rd_op(mem_rd_op),
+        .rd_data(mem_rd_data),
+        .rd_valid(mem_rd_valid),
+        .wr_en(mem_wr_en),
+        .wr_addr(mem_wr_addr),
+        .wr_op(mem_wr_op),
+        .wr_data(mem_wr_data),
+        .wr_valid(mem_wr_valid),
+        .grow_en(mem_grow_en),
+        .grow_pages(mem_grow_pages),
+        .current_pages(mem_current_pages),
+        .grow_result(mem_grow_result),
+        .trap(mem_trap),
+        .dbg_rd_en(dbg_mem_rd_en),
+        .dbg_rd_addr(dbg_mem_rd_addr),
+        .dbg_rd_data(dbg_mem_rd_data)
     );
 
     // Clock generation
