@@ -40,7 +40,12 @@ module wasm_memory
     output logic [31:0] grow_result,  // Previous size or -1 on failure
 
     // Status
-    output trap_t       trap
+    output trap_t       trap,
+
+    // Debug read interface (active when CPU halted)
+    input  logic        dbg_rd_en,
+    input  logic [31:0] dbg_rd_addr,
+    output logic [31:0] dbg_rd_data
 );
 
     // Memory array (byte addressable)
@@ -54,6 +59,16 @@ module wasm_memory
     logic [31:0] max_pages;
 
     assign current_pages = num_pages;
+
+    // Debug read (combinational, 32-bit aligned)
+    always_comb begin
+        if (dbg_rd_en && in_bounds(dbg_rd_addr, 4)) begin
+            dbg_rd_data = {mem[dbg_rd_addr+3], mem[dbg_rd_addr+2],
+                           mem[dbg_rd_addr+1], mem[dbg_rd_addr]};
+        end else begin
+            dbg_rd_data = 32'h0;
+        end
+    end
 
     // Bounds checking - must detect overflow in address+size
     function automatic logic in_bounds(input logic [31:0] addr, input int size);

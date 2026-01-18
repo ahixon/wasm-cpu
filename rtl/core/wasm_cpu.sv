@@ -82,7 +82,27 @@ module wasm_cpu
     output logic [15:0] dbg_stack_ptr,
     output logic [31:0] dbg_saved_next_pc,
     output logic [31:0] dbg_decode_next_pc,
-    output logic [7:0]  dbg_instr_len
+    output logic [7:0]  dbg_instr_len,
+
+    // External halt/resume interface (for SoC integration)
+    // These have defaults so CPU works standalone without supervisor
+    input  logic        ext_halt_i     = 1'b0,    // External halt request
+    input  logic        ext_resume_i   = 1'b0,    // Resume from external halt
+    input  logic [31:0] ext_resume_pc_i = '0,     // PC to resume at (0 = continue from trap PC)
+    input  logic [31:0] ext_resume_val_i = '0,    // Value to push on stack on resume
+    output logic        ext_halted_o,             // CPU is externally halted (waiting for resume)
+
+    // Import trap information (valid when trap_code == TRAP_IMPORT)
+    output logic [15:0] import_id_o,              // Import function ID (WASI function)
+    output logic [31:0] import_arg0_o,            // Import argument 0
+    output logic [31:0] import_arg1_o,            // Import argument 1
+    output logic [31:0] import_arg2_o,            // Import argument 2
+    output logic [31:0] import_arg3_o,            // Import argument 3
+
+    // Debug memory read interface (active when halted)
+    input  logic        dbg_mem_rd_en,
+    input  logic [31:0] dbg_mem_rd_addr,
+    output logic [31:0] dbg_mem_rd_data
 );
 
     // =========================================================================
@@ -131,6 +151,13 @@ module wasm_cpu
     // Result capture state - for multi-value returns
     logic [7:0]  capture_result_idx;    // Current result being captured (0 = TOS = last result)
     logic [7:0]  capture_result_count;  // Total number of results to capture
+
+    // Import trap state - captured when TRAP_IMPORT occurs
+    logic [15:0] import_id_q;           // Import function ID
+    logic [31:0] import_arg0_q;         // Import arguments
+    logic [31:0] import_arg1_q;
+    logic [31:0] import_arg2_q;
+    logic [31:0] import_arg3_q;
 
     // Code memory
     logic [7:0] code_mem [0:CODE_SIZE-1];
@@ -374,7 +401,10 @@ module wasm_cpu
         .grow_pages(mem_grow_pages),
         .current_pages(mem_current_pages),
         .grow_result(mem_grow_result),
-        .trap(mem_trap)
+        .trap(mem_trap),
+        .dbg_rd_en(dbg_mem_rd_en),
+        .dbg_rd_addr(dbg_mem_rd_addr),
+        .dbg_rd_data(dbg_mem_rd_data)
     );
 
     // =========================================================================
@@ -718,6 +748,12 @@ module wasm_cpu
             branch_pop_pending <= 1'b0;
             branch_mv_idx <= 8'h0;
             branch_mv_arity <= 8'h0;
+            // Import trap state
+            import_id_q <= 16'h0;
+            import_arg0_q <= 32'h0;
+            import_arg1_q <= 32'h0;
+            import_arg2_q <= 32'h0;
+            import_arg3_q <= 32'h0;
         end else begin
             // Default assignments
             stack_push_en <= 1'b0;
@@ -1019,19 +1055,41 @@ module wasm_cpu
                         end
 
                         OP_CALL: begin
-                            // Call function - need to copy arguments from stack to locals
-                            call_func_idx <= saved_decoded.immediate[15:0];
-                            call_param_count <= func_table[saved_decoded.immediate[15:0]].param_count;
-                            call_arg_idx <= 8'd0;
-                            // Initialize peek offset to read the first argument (deepest on stack)
-                            // arg0 is at offset (param_count - 1) from TOS
-                            call_peek_offset <= {8'b0, func_table[saved_decoded.immediate[15:0]].param_count - 8'd1};
-                            // Allocate locals for the called function starting at current position
-                            // The arguments will be written starting at this base
-                            call_new_local_base <= current_frame.local_base +
-                                                   func_table[current_frame.func_idx].param_count +
-                                                   func_table[current_frame.func_idx].local_count;
-                            state <= STATE_CALL;
+                            // Check if this is an import function (WASI call)
+                            // Convention: code_offset == 0xFFFFFFFF indicates import
+                            //             code_length contains the import/WASI function ID
+                            if (func_table[saved_decoded.immediate[15:0]].code_offset == 32'hFFFFFFFF) begin
+                                // Import call - trap for supervisor handling
+                                trap_code <= TRAP_IMPORT;
+                                trapped <= 1'b1;
+                                // Capture import info
+                                import_id_q <= func_table[saved_decoded.immediate[15:0]].code_length[15:0];
+                                // Capture arguments from stack (up to 4)
+                                // Arguments are on stack: TOS = last arg, deeper = earlier args
+                                // operand_a = stack_pop_data = TOS (combinational, always valid)
+                                // stack_peek_data uses peek_offset=1, so it's TOS-1
+                                // stack_peek_data2 uses peek_offset2=2, so it's TOS-2
+                                import_arg0_q <= operand_a.value[31:0];         // TOS (last arg pushed)
+                                import_arg1_q <= stack_peek_data.value[31:0];   // TOS-1
+                                import_arg2_q <= stack_peek_data2.value[31:0];  // TOS-2
+                                // Note: For 4th arg, would need additional peek port
+                                import_arg3_q <= 32'h0;
+                                state <= STATE_TRAP;
+                            end else begin
+                                // Normal function call - copy arguments from stack to locals
+                                call_func_idx <= saved_decoded.immediate[15:0];
+                                call_param_count <= func_table[saved_decoded.immediate[15:0]].param_count;
+                                call_arg_idx <= 8'd0;
+                                // Initialize peek offset to read the first argument (deepest on stack)
+                                // arg0 is at offset (param_count - 1) from TOS
+                                call_peek_offset <= {8'b0, func_table[saved_decoded.immediate[15:0]].param_count - 8'd1};
+                                // Allocate locals for the called function starting at current position
+                                // The arguments will be written starting at this base
+                                call_new_local_base <= current_frame.local_base +
+                                                       func_table[current_frame.func_idx].param_count +
+                                                       func_table[current_frame.func_idx].local_count;
+                                state <= STATE_CALL;
+                            end
                         end
 
                         OP_CALL_INDIRECT: begin
@@ -1579,10 +1637,26 @@ module wasm_cpu
                         end
 
                         OP_MEMORY_GROW: begin
-                            stack_pop_en <= 1'b1;
-                            mem_grow_en <= 1'b1;
-                            mem_grow_pages <= operand_a.value[31:0];
-                            state <= STATE_MEMORY;
+                            // If supervisor is connected (ext_halt_i), trap for approval
+                            // Otherwise handle locally for standalone operation
+                            if (ext_halt_i) begin
+                                trap_code <= TRAP_MEMORY_GROW;
+                                trapped <= 1'b1;
+                                // Store requested pages in import_arg0 for supervisor
+                                import_id_q <= 16'h0;  // Not a WASI call
+                                import_arg0_q <= operand_a.value[31:0];  // Requested pages
+                                import_arg1_q <= mem_current_pages;       // Current pages
+                                import_arg2_q <= mem_init_max_pages;      // Max pages (from init)
+                                import_arg3_q <= 32'h0;
+                                stack_pop_en <= 1'b1;  // Pop the requested pages argument
+                                state <= STATE_TRAP;
+                            end else begin
+                                // Standalone: handle locally
+                                stack_pop_en <= 1'b1;
+                                mem_grow_en <= 1'b1;
+                                mem_grow_pages <= operand_a.value[31:0];
+                                state <= STATE_MEMORY;
+                            end
                         end
 
                         // ==== Numeric Constants ====
@@ -2574,12 +2648,16 @@ module wasm_cpu
                 end
 
                 STATE_TRAP: begin
-                    // Stay in trap state, but allow restart
+                    // Trap occurred - check if supervisor wants to handle it
                     trapped <= 1'b1;
                     halted <= 1'b1;
 
-                    if (start) begin
-                        // Restart execution at entry function
+                    if (ext_halt_i && (trap_code == TRAP_IMPORT || trap_code == TRAP_MEMORY_GROW)) begin
+                        // Supervisor is connected and wants to handle this trap
+                        // Transition to EXT_HALT to wait for resume
+                        state <= STATE_EXT_HALT;
+                    end else if (start) begin
+                        // Restart execution at entry function (no supervisor handling)
                         pc <= func_table[entry_func].code_offset;
                         state <= STATE_FETCH;
                         halted <= 1'b0;
@@ -2618,11 +2696,63 @@ module wasm_cpu
                     end
                 end
 
+                STATE_EXT_HALT: begin
+                    // Externally halted, waiting for supervisor to resume
+                    // Import trap info is captured in import_*_q registers
+                    if (ext_resume_i) begin
+                        // Resume execution - supervisor has handled the trap
+                        // If resume_pc is non-zero, use it; otherwise continue from trap PC
+                        if (ext_resume_pc_i != '0) begin
+                            pc <= ext_resume_pc_i;
+                        end
+                        // If resume_val is provided, push it on stack (for return values)
+                        if (ext_resume_val_i != '0 || trap_code == TRAP_IMPORT) begin
+                            stack_push_en <= 1'b1;
+                            stack_push_data.vtype <= TYPE_I32;
+                            stack_push_data.value <= {32'b0, ext_resume_val_i};
+                        end
+                        state <= STATE_FETCH;
+                        halted <= 1'b0;
+                        trapped <= 1'b0;
+                        trap_code <= TRAP_NONE;
+                    end else if (start) begin
+                        // Allow full restart as an alternative to resume
+                        pc <= func_table[entry_func].code_offset;
+                        state <= STATE_FETCH;
+                        halted <= 1'b0;
+                        trapped <= 1'b0;
+                        trap_code <= TRAP_NONE;
+                        frame_push_en <= 1'b1;
+                        frame_push_data.return_pc <= 32'hFFFFFFFF;
+                        frame_push_data.func_idx <= entry_func[15:0];
+                        frame_push_data.local_base <= stack_ptr;
+                        frame_push_data.stack_height <= stack_ptr;
+                        frame_push_data.label_height <= 8'h0;
+                        frame_push_data.arity <= func_table[entry_func].result_count;
+                    end
+                end
+
                 default: begin
                     state <= STATE_IDLE;
                 end
             endcase
         end
     end
+
+    // =========================================================================
+    // External Halt/Resume Interface Outputs
+    // =========================================================================
+
+    // CPU is externally halted when in STATE_EXT_HALT or transitioning to it
+    assign ext_halted_o = (state == STATE_EXT_HALT) ||
+                          (state == STATE_TRAP && ext_halt_i &&
+                           (trap_code == TRAP_IMPORT || trap_code == TRAP_MEMORY_GROW));
+
+    // Import trap information outputs
+    assign import_id_o   = import_id_q;
+    assign import_arg0_o = import_arg0_q;
+    assign import_arg1_o = import_arg1_q;
+    assign import_arg2_o = import_arg2_q;
+    assign import_arg3_o = import_arg3_q;
 
 endmodule

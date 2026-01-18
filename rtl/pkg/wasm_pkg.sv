@@ -342,7 +342,8 @@ package wasm_pkg;
         STATE_BR_UNWIND,     // Unwinding stack after branch
         STATE_CAPTURE_RESULTS, // Capturing multi-value results before halt
         STATE_TRAP,
-        STATE_HALT
+        STATE_HALT,
+        STATE_EXT_HALT       // Halted by external supervisor, waiting for resume
     } exec_state_t;
 
     // =========================================================================
@@ -360,7 +361,9 @@ package wasm_pkg;
         TRAP_UNINITIALIZED_ELEMENT,
         TRAP_STACK_OVERFLOW,
         TRAP_STACK_UNDERFLOW,
-        TRAP_CALL_STACK_EXHAUSTED
+        TRAP_CALL_STACK_EXHAUSTED,
+        TRAP_IMPORT,         // Unresolved import (WASI call) - requires S-mode handling
+        TRAP_MEMORY_GROW     // memory.grow request - requires S-mode approval
     } trap_t;
 
     // =========================================================================
