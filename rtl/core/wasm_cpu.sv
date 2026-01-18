@@ -1,0 +1,2156 @@
+// WebAssembly CPU Core
+// Main execution unit that orchestrates all components
+
+module wasm_cpu
+    import wasm_pkg::*;
+#(
+    parameter int CODE_SIZE = 65536,   // 64KB code memory
+    parameter int STACK_SIZE = STACK_DEPTH,
+    parameter int MEM_PAGES = MEMORY_PAGES
+)(
+    input  logic        clk,
+    input  logic        rst_n,
+
+    // Control interface
+    input  logic        start,
+    input  logic [31:0] entry_func,
+    output logic        halted,
+    output logic        trapped,
+    output trap_t       trap_code,
+
+    // Code memory interface (initialized externally)
+    input  logic        code_wr_en,
+    input  logic [31:0] code_wr_addr,
+    input  logic [7:0]  code_wr_data,
+
+    // Function table interface
+    input  logic        func_wr_en,
+    input  logic [15:0] func_wr_idx,
+    input  func_entry_t func_wr_data,
+
+    // Memory initialization interface
+    input  logic        mem_init_en,
+    input  logic [31:0] mem_init_pages,
+
+    // Memory data initialization interface (for data segments)
+    input  logic        mem_data_wr_en,
+    input  logic [31:0] mem_data_wr_addr,
+    input  logic [7:0]  mem_data_wr_data,
+
+    // Result output
+    output logic        result_valid,
+    output stack_entry_t result_value,
+
+    // Debug interface
+    output logic [31:0] dbg_pc,
+    output exec_state_t dbg_state,
+    output logic [15:0] dbg_stack_ptr,
+    output logic [31:0] dbg_saved_next_pc,
+    output logic [31:0] dbg_decode_next_pc,
+    output logic [7:0]  dbg_instr_len
+);
+
+    // =========================================================================
+    // Internal Signals
+    // =========================================================================
+
+    // Program counter
+    logic [31:0] pc, next_pc;
+
+    // Execution state machine
+    exec_state_t state, next_state;
+
+    // Scanning state for if/else/end
+    logic [7:0]  scan_depth;        // Nesting depth during scan
+    logic        scan_for_else;     // 1=looking for else/end, 0=just end
+    logic        scan_needs_unwind; // 1=branch scan (needs stack unwind), 0=else-skip (no unwind)
+
+    // br_table state
+    logic [31:0] br_table_pc;       // Current PC in br_table targets
+    logic [31:0] br_table_index;    // Target index to find
+    logic [31:0] br_table_count;    // Number of targets
+    logic [31:0] br_table_current;  // Current target number being scanned
+    logic [7:0]  br_table_depth;    // Branch depth to use
+    logic [31:0] scan_br_table_start;  // Start PC for scanning br_table during STATE_SCAN_END
+    logic [31:0] scan_br_table_remaining;  // Remaining targets + default to skip
+
+    // Branch stack unwind state
+    logic [15:0] branch_target_stack_height;  // Stack height to restore to
+    logic [7:0]  branch_target_arity;         // Number of result values to keep
+    logic [31:0] branch_target_pc;            // Saved target PC (for func return check)
+    stack_entry_t branch_saved_value;         // Saved result value (for arity=1)
+    logic        branch_pop_pending;          // Pop from br_if that hasn't taken effect yet
+
+    // Code memory
+    logic [7:0] code_mem [0:CODE_SIZE-1];
+    logic [7:0] instr_bytes [0:15];
+    logic [3:0] bytes_available;
+
+    // Decoded instruction
+    logic        decode_valid;
+    decoded_instr_t decoded;
+    logic [31:0] decode_next_pc;
+
+    // Function table
+    func_entry_t func_table [0:MAX_FUNCTIONS-1];
+
+    // =========================================================================
+    // Operand Stack
+    // =========================================================================
+    logic        stack_push_en;
+    stack_entry_t stack_push_data;
+    logic        stack_pop_en;
+    stack_entry_t stack_pop_data;
+    logic [15:0] stack_peek_offset;
+    stack_entry_t stack_peek_data;
+    logic [15:0] stack_peek_offset2;
+    stack_entry_t stack_peek_data2;
+    logic        stack_multi_pop_en;
+    logic [7:0]  stack_multi_pop_count;
+    logic        stack_set_sp_en;
+    logic [15:0] stack_set_sp_value;
+    logic [15:0] stack_ptr;
+    logic        stack_empty, stack_full;
+    trap_t       stack_trap;
+
+    wasm_stack #(.DEPTH(STACK_SIZE)) operand_stack (
+        .clk(clk),
+        .rst_n(rst_n),
+        .push_en(stack_push_en),
+        .push_data(stack_push_data),
+        .pop_en(stack_pop_en),
+        .pop_data(stack_pop_data),
+        .peek_offset(stack_peek_offset),
+        .peek_data(stack_peek_data),
+        .peek_offset2(stack_peek_offset2),
+        .peek_data2(stack_peek_data2),
+        .multi_pop_en(stack_multi_pop_en),
+        .multi_pop_count(stack_multi_pop_count),
+        .set_sp_en(stack_set_sp_en),
+        .set_sp_value(stack_set_sp_value),
+        .stack_ptr(stack_ptr),
+        .empty(stack_empty),
+        .full(stack_full),
+        .trap(stack_trap)
+    );
+
+    // =========================================================================
+    // Label Stack
+    // =========================================================================
+    logic        label_push_en;
+    label_entry_t label_push_data;
+    logic        label_pop_en;
+    label_entry_t label_pop_data;
+    logic [7:0]  label_branch_depth_comb; // Combinational depth for target lookup
+    label_entry_t label_branch_target;
+    logic        label_branch_pop_en;
+    logic        label_set_sp_en;
+    logic [7:0]  label_set_sp_value;
+    logic [7:0]  label_stack_ptr;
+    logic        label_empty, label_full;
+
+    // Combinational branch depth selection
+    always_comb begin
+        // Default to saved decoded immediate for br/br_if
+        // During STATE_BR_TABLE and subsequent states, use br_table_depth
+        if (state == STATE_BR_TABLE || (saved_decoded.opcode == OP_BR_TABLE &&
+            (state == STATE_SCAN_END || state == STATE_BR_UNWIND)))
+            label_branch_depth_comb = br_table_depth;
+        else
+            label_branch_depth_comb = saved_decoded.immediate[7:0];
+    end
+
+    // Combinational logic for stack peek offsets
+    // Must be in always_comb so peek_data is valid when read in always_ff
+    always_comb begin
+        // Default offsets for most operations
+        stack_peek_offset = 16'd1;   // TOS-1
+        stack_peek_offset2 = 16'd2;  // TOS-2
+    end
+
+    wasm_label_stack label_stack (
+        .clk(clk),
+        .rst_n(rst_n),
+        .push_en(label_push_en),
+        .push_data(label_push_data),
+        .pop_en(label_pop_en),
+        .pop_data(label_pop_data),
+        .branch_depth(label_branch_depth_comb),  // Use combinational depth for lookup
+        .branch_target(label_branch_target),
+        .branch_pop_en(label_branch_pop_en),
+        .set_sp_en(label_set_sp_en),
+        .set_sp_value(label_set_sp_value),
+        .stack_ptr(label_stack_ptr),
+        .empty(label_empty),
+        .full(label_full)
+    );
+
+    // =========================================================================
+    // Call Stack
+    // =========================================================================
+    logic        frame_push_en;
+    frame_entry_t frame_push_data;
+    logic        frame_pop_en;
+    frame_entry_t frame_pop_data;
+    frame_entry_t current_frame;
+    logic [7:0]  frame_stack_ptr;
+    logic        frame_empty, frame_full;
+    trap_t       frame_trap;
+
+    wasm_call_stack call_stack (
+        .clk(clk),
+        .rst_n(rst_n),
+        .push_en(frame_push_en),
+        .push_data(frame_push_data),
+        .pop_en(frame_pop_en),
+        .pop_data(frame_pop_data),
+        .current_frame(current_frame),
+        .stack_ptr(frame_stack_ptr),
+        .empty(frame_empty),
+        .full(frame_full),
+        .trap(frame_trap)
+    );
+
+    // =========================================================================
+    // Linear Memory
+    // =========================================================================
+    logic        mem_rd_en;
+    logic [31:0] mem_rd_addr;
+    mem_op_t     mem_rd_op;
+    logic [63:0] mem_rd_data;
+    logic        mem_rd_valid;
+    logic        mem_wr_en;
+    logic [31:0] mem_wr_addr;
+    mem_op_t     mem_wr_op;
+    logic [63:0] mem_wr_data;
+    logic        mem_wr_valid;
+    logic        mem_grow_en;
+    logic [31:0] mem_grow_pages;
+    logic [31:0] mem_current_pages;
+    logic [31:0] mem_grow_result;
+    trap_t       mem_trap;
+
+    wasm_memory #(.MAX_PAGES(MEM_PAGES)) linear_memory (
+        .clk(clk),
+        .rst_n(rst_n),
+        .init_en(mem_init_en),
+        .init_pages(mem_init_pages),
+        .data_wr_en(mem_data_wr_en),
+        .data_wr_addr(mem_data_wr_addr),
+        .data_wr_data(mem_data_wr_data),
+        .rd_en(mem_rd_en),
+        .rd_addr(mem_rd_addr),
+        .rd_op(mem_rd_op),
+        .rd_data(mem_rd_data),
+        .rd_valid(mem_rd_valid),
+        .wr_en(mem_wr_en),
+        .wr_addr(mem_wr_addr),
+        .wr_op(mem_wr_op),
+        .wr_data(mem_wr_data),
+        .wr_valid(mem_wr_valid),
+        .grow_en(mem_grow_en),
+        .grow_pages(mem_grow_pages),
+        .current_pages(mem_current_pages),
+        .grow_result(mem_grow_result),
+        .trap(mem_trap)
+    );
+
+    // =========================================================================
+    // Local Variables
+    // =========================================================================
+    logic        local_rd_en;
+    logic [15:0] local_base_idx;
+    logic [7:0]  local_idx;
+    stack_entry_t local_rd_data;
+    logic        local_rd_valid;
+    logic        local_wr_en;
+    logic [15:0] local_wr_base_idx;
+    logic [7:0]  local_wr_idx;
+    stack_entry_t local_wr_data;
+    logic        local_wr_valid;
+
+    valtype_t local_init_types [0:31];
+    assign local_init_types = '{default: TYPE_I32};
+
+    wasm_locals locals_inst (
+        .clk(clk),
+        .rst_n(rst_n),
+        .rd_en(local_rd_en),
+        .base_idx(local_base_idx),
+        .local_idx(local_idx),
+        .rd_data(local_rd_data),
+        .rd_valid(local_rd_valid),
+        .wr_en(local_wr_en),
+        .wr_base_idx(local_wr_base_idx),
+        .wr_local_idx(local_wr_idx),
+        .wr_data(local_wr_data),
+        .wr_valid(local_wr_valid),
+        .init_en(1'b0),
+        .init_base(16'h0),
+        .init_count(8'h0),
+        .init_types(local_init_types),
+        .next_free_base()
+    );
+
+    // =========================================================================
+    // Global Variables
+    // =========================================================================
+    logic        global_rd_en;
+    logic [7:0]  global_rd_idx;
+    stack_entry_t global_rd_data;
+    logic        global_rd_valid;
+    logic        global_wr_en;
+    logic [7:0]  global_wr_idx;
+    stack_entry_t global_wr_data;
+    logic        global_wr_valid;
+    logic        global_wr_error;
+
+    wasm_globals globals_inst (
+        .clk(clk),
+        .rst_n(rst_n),
+        .rd_en(global_rd_en),
+        .rd_idx(global_rd_idx),
+        .rd_data(global_rd_data),
+        .rd_valid(global_rd_valid),
+        .wr_en(global_wr_en),
+        .wr_idx(global_wr_idx),
+        .wr_data(global_wr_data),
+        .wr_valid(global_wr_valid),
+        .wr_error(global_wr_error),
+        .init_en(1'b0),
+        .init_idx(8'h0),
+        .init_data('0),
+        .num_globals()
+    );
+
+    // =========================================================================
+    // ALU Units
+    // =========================================================================
+    logic        alu_i32_valid_in;
+    alu_op_t     alu_i32_op;
+    logic [31:0] alu_i32_a, alu_i32_b;
+    logic        alu_i32_valid_out;
+    logic [31:0] alu_i32_result;
+    trap_t       alu_i32_trap;
+
+    wasm_alu_i32 alu_i32 (
+        .clk(clk),
+        .rst_n(rst_n),
+        .valid_in(alu_i32_valid_in),
+        .op(alu_i32_op),
+        .operand_a(alu_i32_a),
+        .operand_b(alu_i32_b),
+        .valid_out(alu_i32_valid_out),
+        .result(alu_i32_result),
+        .trap(alu_i32_trap)
+    );
+
+    logic        alu_i64_valid_in;
+    alu_op_t     alu_i64_op;
+    logic [63:0] alu_i64_a, alu_i64_b;
+    logic        alu_i64_valid_out;
+    logic [63:0] alu_i64_result;
+    trap_t       alu_i64_trap;
+
+    wasm_alu_i64 alu_i64 (
+        .clk(clk),
+        .rst_n(rst_n),
+        .valid_in(alu_i64_valid_in),
+        .op(alu_i64_op),
+        .operand_a(alu_i64_a),
+        .operand_b(alu_i64_b),
+        .valid_out(alu_i64_valid_out),
+        .result(alu_i64_result),
+        .trap(alu_i64_trap)
+    );
+
+    // =========================================================================
+    // FPU Units
+    // =========================================================================
+    logic        fpu_f32_valid_in;
+    fpu_op_t     fpu_f32_op;
+    logic [31:0] fpu_f32_a, fpu_f32_b;
+    logic        fpu_f32_valid_out;
+    logic [31:0] fpu_f32_result;
+    trap_t       fpu_f32_trap;
+
+    wasm_fpu_f32 fpu_f32 (
+        .clk(clk),
+        .rst_n(rst_n),
+        .valid_in(fpu_f32_valid_in),
+        .op(fpu_f32_op),
+        .operand_a(fpu_f32_a),
+        .operand_b(fpu_f32_b),
+        .valid_out(fpu_f32_valid_out),
+        .result(fpu_f32_result),
+        .trap(fpu_f32_trap)
+    );
+
+    logic        fpu_f64_valid_in;
+    fpu_op_t     fpu_f64_op;
+    logic [63:0] fpu_f64_a, fpu_f64_b;
+    logic        fpu_f64_valid_out;
+    logic [63:0] fpu_f64_result;
+    trap_t       fpu_f64_trap;
+
+    wasm_fpu_f64 fpu_f64 (
+        .clk(clk),
+        .rst_n(rst_n),
+        .valid_in(fpu_f64_valid_in),
+        .op(fpu_f64_op),
+        .operand_a(fpu_f64_a),
+        .operand_b(fpu_f64_b),
+        .valid_out(fpu_f64_valid_out),
+        .result(fpu_f64_result),
+        .trap(fpu_f64_trap)
+    );
+
+    // =========================================================================
+    // Conversion Unit
+    // =========================================================================
+    logic        conv_valid_in;
+    opcode_t     conv_op;
+    logic [7:0]  conv_sub_op;     // For extended opcodes
+    logic [63:0] conv_operand;
+    logic        conv_valid_out;
+    logic [63:0] conv_result;
+    trap_t       conv_trap;
+
+    wasm_conv converter (
+        .clk(clk),
+        .rst_n(rst_n),
+        .valid_in(conv_valid_in),
+        .op(conv_op),
+        .sub_op(conv_sub_op),
+        .operand(conv_operand),
+        .valid_out(conv_valid_out),
+        .result(conv_result),
+        .trap(conv_trap)
+    );
+
+    // =========================================================================
+    // Decoder
+    // =========================================================================
+    wasm_decoder decoder (
+        .clk(clk),
+        .rst_n(rst_n),
+        .valid_in(state == STATE_DECODE),
+        .pc(pc),
+        .instr_bytes(instr_bytes),
+        .bytes_available(bytes_available),
+        .valid_out(decode_valid),
+        .decoded(decoded),
+        .next_pc(decode_next_pc)
+    );
+
+    // =========================================================================
+    // Code Memory Interface
+    // =========================================================================
+    always_ff @(posedge clk) begin
+        if (code_wr_en) begin
+            code_mem[code_wr_addr] <= code_wr_data;
+        end
+    end
+
+    // Fetch instruction bytes
+    always_comb begin
+        bytes_available = 4'd15;
+        for (int i = 0; i < 16; i++) begin
+            if (pc + i < CODE_SIZE) begin
+                instr_bytes[i] = code_mem[pc + i];
+            end else begin
+                instr_bytes[i] = 8'h00;
+            end
+        end
+    end
+
+    // =========================================================================
+    // Function Table Interface
+    // =========================================================================
+    always_ff @(posedge clk) begin
+        if (func_wr_en) begin
+            func_table[func_wr_idx] <= func_wr_data;
+        end
+    end
+
+    // =========================================================================
+    // Debug Outputs
+    // =========================================================================
+    assign dbg_pc = pc;
+    assign dbg_state = state;
+    assign dbg_stack_ptr = stack_ptr;
+    assign dbg_saved_next_pc = saved_next_pc;
+    assign dbg_decode_next_pc = decode_next_pc;
+    assign dbg_instr_len = decoded.instr_length;
+
+    // =========================================================================
+    // Execution State Machine
+    // =========================================================================
+
+    // Intermediate values for execution
+    stack_entry_t operand_a, operand_b, operand_c;
+    logic [31:0] effective_addr;
+    logic [32:0] effective_addr_full;  // 33-bit to detect overflow
+    logic        effective_addr_overflow;
+    logic [63:0] exec_result;
+    valtype_t    exec_result_type;
+    logic        exec_trap_flag;
+    trap_t       exec_trap;
+
+    // Saved decoded instruction and next PC
+    decoded_instr_t saved_decoded;
+    logic [31:0] saved_next_pc;
+
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            state <= STATE_IDLE;
+            pc <= 32'h0;
+            halted <= 1'b0;
+            trapped <= 1'b0;
+            trap_code <= TRAP_NONE;
+            result_valid <= 1'b0;
+            result_value <= '0;
+            saved_decoded <= '0;
+            saved_next_pc <= 32'h0;
+            exec_result <= 64'h0;
+            exec_result_type <= TYPE_I32;
+            scan_depth <= 8'h0;
+            scan_for_else <= 1'b0;
+            scan_needs_unwind <= 1'b0;
+            br_table_depth <= 8'h0;
+            br_table_pc <= 32'h0;
+            br_table_index <= 32'h0;
+            br_table_count <= 32'h0;
+            br_table_current <= 32'h0;
+            branch_target_stack_height <= 16'h0;
+            branch_target_arity <= 8'h0;
+            branch_target_pc <= 32'h0;
+            branch_saved_value <= '0;
+            branch_pop_pending <= 1'b0;
+        end else begin
+            // Default assignments
+            stack_push_en <= 1'b0;
+            stack_pop_en <= 1'b0;
+            stack_multi_pop_en <= 1'b0;
+            stack_set_sp_en <= 1'b0;
+            label_push_en <= 1'b0;
+            label_pop_en <= 1'b0;
+            label_branch_pop_en <= 1'b0;
+            label_set_sp_en <= 1'b0;
+            frame_push_en <= 1'b0;
+            frame_pop_en <= 1'b0;
+            mem_rd_en <= 1'b0;
+            mem_wr_en <= 1'b0;
+            mem_grow_en <= 1'b0;
+            local_rd_en <= 1'b0;
+            local_wr_en <= 1'b0;
+            global_rd_en <= 1'b0;
+            global_wr_en <= 1'b0;
+            alu_i32_valid_in <= 1'b0;
+            alu_i64_valid_in <= 1'b0;
+            fpu_f32_valid_in <= 1'b0;
+            fpu_f64_valid_in <= 1'b0;
+            conv_valid_in <= 1'b0;
+            conv_sub_op <= 8'h0;
+            result_valid <= 1'b0;
+
+            case (state)
+                STATE_IDLE: begin
+                    if (start) begin
+                        // Start execution at entry function
+                        pc <= func_table[entry_func].code_offset;
+                        state <= STATE_FETCH;
+                        halted <= 1'b0;
+                        trapped <= 1'b0;
+
+                        // Push initial frame for entry function
+                        frame_push_en <= 1'b1;
+                        frame_push_data.return_pc <= 32'hFFFFFFFF;  // Special: no return
+                        frame_push_data.func_idx <= entry_func[15:0];
+                        frame_push_data.local_base <= 16'h0;
+                        frame_push_data.stack_height <= 16'h0;
+                        frame_push_data.label_height <= 8'h0;
+                        frame_push_data.arity <= func_table[entry_func].result_count;
+                    end
+                end
+
+                STATE_FETCH: begin
+                    // Move to decode immediately (instruction bytes are ready combinationally)
+                    state <= STATE_DECODE;
+                end
+
+                STATE_DECODE: begin
+                    if (decode_valid) begin
+                        saved_decoded <= decoded;
+                        saved_next_pc <= decode_next_pc;
+                        state <= STATE_EXECUTE;
+                    end
+                end
+
+                STATE_EXECUTE: begin
+                    // Read stack values for operations
+                    // peek offsets are set combinationally in always_comb block above
+                    // Read values
+                    operand_a = stack_pop_data;  // TOS
+                    operand_b = stack_peek_data;  // TOS-1 (offset 1)
+                    operand_c = stack_peek_data2; // TOS-2 (offset 2)
+
+                    case (saved_decoded.opcode)
+                        // ==== Control Instructions ====
+                        OP_UNREACHABLE: begin
+                            trapped <= 1'b1;
+                            trap_code <= TRAP_UNREACHABLE;
+                            state <= STATE_TRAP;
+                        end
+
+                        OP_NOP: begin
+                            pc <= saved_next_pc;
+                            state <= STATE_FETCH;
+                        end
+
+                        OP_BLOCK: begin
+                            // Push label for block continuation
+                            label_push_en <= 1'b1;
+                            label_push_data.target_pc <= 32'h0;  // Will be set when we find END
+                            label_push_data.stack_height <= stack_ptr;
+                            label_push_data.arity <= (saved_decoded.immediate == 64'hFFFFFFFF) ? 8'h0 : 8'h1;
+                            label_push_data.is_loop <= 1'b0;
+                            pc <= saved_next_pc;
+                            state <= STATE_FETCH;
+                        end
+
+                        OP_LOOP: begin
+                            // Push label for loop start
+                            label_push_en <= 1'b1;
+                            label_push_data.target_pc <= saved_next_pc;  // Loop branches go to start
+                            label_push_data.stack_height <= stack_ptr;
+                            label_push_data.arity <= 8'h0;  // Loop takes no params from stack
+                            label_push_data.is_loop <= 1'b1;
+                            pc <= saved_next_pc;
+                            state <= STATE_FETCH;
+                        end
+
+                        OP_IF: begin
+                            // Pop condition
+                            stack_pop_en <= 1'b1;
+                            if (operand_a.value[31:0] != 32'h0) begin
+                                // Condition true (non-zero) - enter if block
+                                label_push_en <= 1'b1;
+                                label_push_data.target_pc <= 32'h0;
+                                label_push_data.stack_height <= stack_ptr - 1;
+                                label_push_data.arity <= (saved_decoded.immediate == 64'hFFFFFFFF) ? 8'h0 : 8'h1;
+                                label_push_data.is_loop <= 1'b0;
+                                pc <= saved_next_pc;
+                                state <= STATE_FETCH;
+                            end else begin
+                                // Condition false - skip to else/end
+                                scan_depth <= 8'h0;
+                                scan_for_else <= 1'b1;
+                                pc <= saved_next_pc;
+                                state <= STATE_SCAN_ELSE;
+                            end
+                        end
+
+                        OP_ELSE: begin
+                            // After then-block, skip to end of if-else
+                            label_pop_en <= 1'b1;  // Pop the if label
+                            scan_depth <= 8'h0;
+                            scan_for_else <= 1'b0;
+                            scan_needs_unwind <= 1'b0;  // Else-skip doesn't need unwinding
+                            pc <= saved_next_pc;
+                            state <= STATE_SCAN_END;
+                        end
+
+                        OP_END: begin
+                            if (!label_empty) begin
+                                label_pop_en <= 1'b1;
+                            end
+                            // Check if this is function end (after pop, sp will equal label_height)
+                            if (label_empty || label_stack_ptr == current_frame.label_height) begin
+                                // Function return
+                                if (current_frame.return_pc == 32'hFFFFFFFF) begin
+                                    // Entry function return - halt
+                                    if (!stack_empty) begin
+                                        result_valid <= 1'b1;
+                                        result_value <= stack_pop_data;
+                                    end
+                                    halted <= 1'b1;
+                                    state <= STATE_HALT;
+                                end else begin
+                                    frame_pop_en <= 1'b1;
+                                    pc <= current_frame.return_pc;
+                                    state <= STATE_FETCH;
+                                end
+                            end else begin
+                                pc <= saved_next_pc;
+                                state <= STATE_FETCH;
+                            end
+                        end
+
+                        OP_BR: begin
+                            // Unconditional branch
+                            // Check if branch targets function level (implicit function block)
+                            // func_label_count = labels pushed in this function
+                            logic [7:0] br_func_label_count;
+                            logic br_is_func_return;
+                            br_func_label_count = label_stack_ptr - current_frame.label_height;
+                            br_is_func_return = (saved_decoded.immediate[7:0] >= br_func_label_count);
+
+                            if (br_is_func_return) begin
+                                // Branch to function block = return
+                                // Restore label stack to frame's label height
+                                label_set_sp_en <= 1'b1;
+                                label_set_sp_value <= current_frame.label_height;
+                                // Save target info for stack unwinding
+                                branch_target_stack_height <= current_frame.stack_height;
+                                branch_target_arity <= current_frame.arity;
+                                branch_target_pc <= 32'hFFFFFFFF;  // Mark as function return
+                                // Save branch value (TOS = operand_a) for STATE_BR_UNWIND
+                                branch_saved_value <= operand_a;
+                                state <= STATE_BR_UNWIND;
+                            end else begin
+                                // Save target info for stack unwinding
+                                branch_target_stack_height <= label_branch_target.stack_height;
+                                branch_target_arity <= label_branch_target.arity;
+                                branch_target_pc <= label_branch_target.target_pc;
+                                if (label_branch_target.is_loop) begin
+                                    // Loop: pop intermediate labels but keep loop's label
+                                    // Pop only branch_depth labels (not branch_depth + 1)
+                                    if (saved_decoded.immediate[7:0] > 0) begin
+                                        label_set_sp_en <= 1'b1;
+                                        label_set_sp_value <= label_stack_ptr - saved_decoded.immediate[7:0];
+                                    end
+                                    pc <= label_branch_target.target_pc;
+                                    state <= STATE_FETCH;
+                                end else begin
+                                    // Block: pop labels including target block
+                                    label_branch_pop_en <= 1'b1;
+                                    // Block - scan forward to find END, then unwind stack
+                                    scan_depth <= saved_decoded.immediate[7:0];
+                                    scan_for_else <= 1'b0;
+                                    scan_needs_unwind <= 1'b1;  // Branch needs stack unwinding
+                                    pc <= saved_next_pc;
+                                    state <= STATE_SCAN_END;
+                                end
+                            end
+                        end
+
+                        OP_BR_IF: begin
+                            stack_pop_en <= 1'b1;
+                            if (operand_a.value[31:0] != 32'h0) begin
+                                // Take branch (condition is non-zero)
+                                // Check if branch targets function level
+                                logic [7:0] brif_func_label_count;
+                                logic brif_is_func_return;
+                                brif_func_label_count = label_stack_ptr - current_frame.label_height;
+                                brif_is_func_return = (saved_decoded.immediate[7:0] >= brif_func_label_count);
+
+                                if (brif_is_func_return) begin
+                                    // Branch to function block = return
+                                    label_set_sp_en <= 1'b1;
+                                    label_set_sp_value <= current_frame.label_height;
+                                    branch_target_stack_height <= current_frame.stack_height;
+                                    branch_target_arity <= current_frame.arity;
+                                    branch_target_pc <= 32'hFFFFFFFF;
+                                    // Save branch value now (operand_b = TOS-1) since the condition pop
+                                    // won't take effect until next cycle
+                                    branch_saved_value <= operand_b;
+                                    // Mark that a pop is pending so STATE_BR_UNWIND adjusts stack_ptr
+                                    branch_pop_pending <= 1'b1;
+                                    state <= STATE_BR_UNWIND;
+                                end else begin
+                                    branch_target_stack_height <= label_branch_target.stack_height;
+                                    branch_target_arity <= label_branch_target.arity;
+                                    branch_target_pc <= label_branch_target.target_pc;
+                                    if (label_branch_target.is_loop) begin
+                                        // Loop: pop intermediate labels but keep loop's label
+                                        if (saved_decoded.immediate[7:0] > 0) begin
+                                            label_set_sp_en <= 1'b1;
+                                            label_set_sp_value <= label_stack_ptr - saved_decoded.immediate[7:0];
+                                        end
+                                        pc <= label_branch_target.target_pc;
+                                        state <= STATE_FETCH;
+                                    end else begin
+                                        // Block: pop labels including target block
+                                        label_branch_pop_en <= 1'b1;
+                                        // Block - scan forward to find END, then unwind stack
+                                        scan_depth <= saved_decoded.immediate[7:0];
+                                        scan_for_else <= 1'b0;
+                                        scan_needs_unwind <= 1'b1;
+                                        pc <= saved_next_pc;
+                                        state <= STATE_SCAN_END;
+                                    end
+                                end
+                            end else begin
+                                pc <= saved_next_pc;
+                                state <= STATE_FETCH;
+                            end
+                        end
+
+                        OP_BR_TABLE: begin
+                            // Branch table: pop index, select target based on index
+                            // immediate = count of targets
+                            // immediate2 = offset to first target (bytes after opcode for count)
+                            stack_pop_en <= 1'b1;
+                            br_table_index <= operand_a.value[31:0];
+                            br_table_count <= saved_decoded.immediate[31:0];
+                            br_table_pc <= pc + 1 + saved_decoded.immediate2;  // Start of targets
+                            br_table_current <= 32'h0;
+                            state <= STATE_BR_TABLE;
+                        end
+
+                        OP_RETURN: begin
+                            if (current_frame.return_pc == 32'hFFFFFFFF) begin
+                                if (!stack_empty) begin
+                                    result_valid <= 1'b1;
+                                    result_value <= stack_pop_data;
+                                end
+                                halted <= 1'b1;
+                                state <= STATE_HALT;
+                            end else begin
+                                frame_pop_en <= 1'b1;
+                                label_set_sp_en <= 1'b1;
+                                label_set_sp_value <= current_frame.label_height;
+                                pc <= current_frame.return_pc;
+                                state <= STATE_FETCH;
+                            end
+                        end
+
+                        OP_CALL: begin
+                            // Call function
+                            frame_push_en <= 1'b1;
+                            frame_push_data.return_pc <= saved_next_pc;
+                            frame_push_data.func_idx <= saved_decoded.immediate[15:0];
+                            frame_push_data.local_base <= stack_ptr;
+                            frame_push_data.stack_height <= stack_ptr;
+                            frame_push_data.label_height <= label_stack_ptr;
+                            frame_push_data.arity <= func_table[saved_decoded.immediate[15:0]].result_count;
+
+                            pc <= func_table[saved_decoded.immediate[15:0]].code_offset;
+                            state <= STATE_FETCH;
+                        end
+
+                        // ==== Parametric Instructions ====
+                        OP_DROP: begin
+                            stack_pop_en <= 1'b1;
+                            pc <= saved_next_pc;
+                            state <= STATE_FETCH;
+                        end
+
+                        OP_SELECT, OP_SELECT_T: begin
+                            // Pop condition and two values, then push selected
+                            // Stack: [... val1 val2 cond] -> [..., selected]
+                            // operand_a = cond (TOS), operand_b = val2 (TOS-1), operand_c = val1 (TOS-2)
+                            // operand_c is already read via stack_peek_data2
+                            // OP_SELECT_T is the typed version, but works the same since we track types
+
+                            // Do multi-pop first, then push in writeback
+                            stack_multi_pop_en <= 1'b1;
+                            stack_multi_pop_count <= 8'd3;
+
+                            // Save selected value for push in writeback
+                            // WebAssembly select: if cond != 0, return val1, else return val2
+                            if (operand_a.value[31:0] != 32'h0) begin
+                                exec_result <= operand_c.value;  // Select val1 (deeper)
+                                exec_result_type <= operand_c.vtype;
+                            end else begin
+                                exec_result <= operand_b.value;  // Select val2
+                                exec_result_type <= operand_b.vtype;
+                            end
+
+                            state <= STATE_WRITEBACK;
+                        end
+
+                        // ==== Variable Instructions ====
+                        OP_LOCAL_GET: begin
+                            local_rd_en <= 1'b1;
+                            local_base_idx <= current_frame.local_base;
+                            local_idx <= saved_decoded.immediate[7:0];
+                            state <= STATE_MEMORY;
+                        end
+
+                        OP_LOCAL_SET: begin
+                            stack_pop_en <= 1'b1;
+                            local_wr_en <= 1'b1;
+                            local_wr_base_idx <= current_frame.local_base;
+                            local_wr_idx <= saved_decoded.immediate[7:0];
+                            local_wr_data <= operand_a;
+                            pc <= saved_next_pc;
+                            state <= STATE_FETCH;
+                        end
+
+                        OP_LOCAL_TEE: begin
+                            // Set local without popping
+                            local_wr_en <= 1'b1;
+                            local_wr_base_idx <= current_frame.local_base;
+                            local_wr_idx <= saved_decoded.immediate[7:0];
+                            local_wr_data <= operand_a;
+                            pc <= saved_next_pc;
+                            state <= STATE_FETCH;
+                        end
+
+                        OP_GLOBAL_GET: begin
+                            global_rd_en <= 1'b1;
+                            global_rd_idx <= saved_decoded.immediate[7:0];
+                            state <= STATE_MEMORY;
+                        end
+
+                        OP_GLOBAL_SET: begin
+                            stack_pop_en <= 1'b1;
+                            global_wr_en <= 1'b1;
+                            global_wr_idx <= saved_decoded.immediate[7:0];
+                            global_wr_data <= operand_a;
+                            pc <= saved_next_pc;
+                            state <= STATE_FETCH;
+                        end
+
+                        // ==== Memory Instructions ====
+                        OP_I32_LOAD: begin
+                            stack_pop_en <= 1'b1;
+                            effective_addr_full = {1'b0, operand_a.value[31:0]} + {1'b0, saved_decoded.immediate2};
+                            effective_addr_overflow = effective_addr_full[32];
+                            effective_addr = effective_addr_full[31:0];
+                            if (effective_addr_overflow) begin
+                                trap_code <= TRAP_OUT_OF_BOUNDS;
+                                state <= STATE_TRAP;
+                            end else begin
+                                mem_rd_en <= 1'b1;
+                                mem_rd_addr <= effective_addr;
+                                mem_rd_op <= MEM_LOAD_I32;
+                                state <= STATE_MEMORY;
+                            end
+                        end
+
+                        OP_I64_LOAD: begin
+                            stack_pop_en <= 1'b1;
+                            effective_addr_full = {1'b0, operand_a.value[31:0]} + {1'b0, saved_decoded.immediate2};
+                            effective_addr_overflow = effective_addr_full[32];
+                            effective_addr = effective_addr_full[31:0];
+                            if (effective_addr_overflow) begin
+                                trap_code <= TRAP_OUT_OF_BOUNDS;
+                                state <= STATE_TRAP;
+                            end else begin
+                                mem_rd_en <= 1'b1;
+                                mem_rd_addr <= effective_addr;
+                                mem_rd_op <= MEM_LOAD_I64;
+                                state <= STATE_MEMORY;
+                            end
+                        end
+
+                        OP_F32_LOAD: begin
+                            stack_pop_en <= 1'b1;
+                            effective_addr_full = {1'b0, operand_a.value[31:0]} + {1'b0, saved_decoded.immediate2};
+                            effective_addr_overflow = effective_addr_full[32];
+                            effective_addr = effective_addr_full[31:0];
+                            if (effective_addr_overflow) begin
+                                trap_code <= TRAP_OUT_OF_BOUNDS;
+                                state <= STATE_TRAP;
+                            end else begin
+                                mem_rd_en <= 1'b1;
+                                mem_rd_addr <= effective_addr;
+                                mem_rd_op <= MEM_LOAD_F32;
+                                state <= STATE_MEMORY;
+                            end
+                        end
+
+                        OP_F64_LOAD: begin
+                            stack_pop_en <= 1'b1;
+                            effective_addr_full = {1'b0, operand_a.value[31:0]} + {1'b0, saved_decoded.immediate2};
+                            effective_addr_overflow = effective_addr_full[32];
+                            effective_addr = effective_addr_full[31:0];
+                            if (effective_addr_overflow) begin
+                                trap_code <= TRAP_OUT_OF_BOUNDS;
+                                state <= STATE_TRAP;
+                            end else begin
+                                mem_rd_en <= 1'b1;
+                                mem_rd_addr <= effective_addr;
+                                mem_rd_op <= MEM_LOAD_F64;
+                                state <= STATE_MEMORY;
+                            end
+                        end
+
+                        OP_I32_LOAD8_S: begin
+                            stack_pop_en <= 1'b1;
+                            effective_addr_full = {1'b0, operand_a.value[31:0]} + {1'b0, saved_decoded.immediate2};
+                            effective_addr_overflow = effective_addr_full[32];
+                            effective_addr = effective_addr_full[31:0];
+                            if (effective_addr_overflow) begin
+                                trap_code <= TRAP_OUT_OF_BOUNDS;
+                                state <= STATE_TRAP;
+                            end else begin
+                                mem_rd_en <= 1'b1;
+                                mem_rd_addr <= effective_addr;
+                                mem_rd_op <= MEM_LOAD_I8_S;
+                                state <= STATE_MEMORY;
+                            end
+                        end
+
+                        OP_I32_LOAD8_U: begin
+                            stack_pop_en <= 1'b1;
+                            effective_addr_full = {1'b0, operand_a.value[31:0]} + {1'b0, saved_decoded.immediate2};
+                            effective_addr_overflow = effective_addr_full[32];
+                            effective_addr = effective_addr_full[31:0];
+                            if (effective_addr_overflow) begin
+                                trap_code <= TRAP_OUT_OF_BOUNDS;
+                                state <= STATE_TRAP;
+                            end else begin
+                                mem_rd_en <= 1'b1;
+                                mem_rd_addr <= effective_addr;
+                                mem_rd_op <= MEM_LOAD_I8_U;
+                                state <= STATE_MEMORY;
+                            end
+                        end
+
+                        OP_I32_LOAD16_S: begin
+                            stack_pop_en <= 1'b1;
+                            effective_addr_full = {1'b0, operand_a.value[31:0]} + {1'b0, saved_decoded.immediate2};
+                            effective_addr_overflow = effective_addr_full[32];
+                            effective_addr = effective_addr_full[31:0];
+                            if (effective_addr_overflow) begin
+                                trap_code <= TRAP_OUT_OF_BOUNDS;
+                                state <= STATE_TRAP;
+                            end else begin
+                                mem_rd_en <= 1'b1;
+                                mem_rd_addr <= effective_addr;
+                                mem_rd_op <= MEM_LOAD_I16_S;
+                                state <= STATE_MEMORY;
+                            end
+                        end
+
+                        OP_I32_LOAD16_U: begin
+                            stack_pop_en <= 1'b1;
+                            effective_addr_full = {1'b0, operand_a.value[31:0]} + {1'b0, saved_decoded.immediate2};
+                            effective_addr_overflow = effective_addr_full[32];
+                            effective_addr = effective_addr_full[31:0];
+                            if (effective_addr_overflow) begin
+                                trap_code <= TRAP_OUT_OF_BOUNDS;
+                                state <= STATE_TRAP;
+                            end else begin
+                                mem_rd_en <= 1'b1;
+                                mem_rd_addr <= effective_addr;
+                                mem_rd_op <= MEM_LOAD_I16_U;
+                                state <= STATE_MEMORY;
+                            end
+                        end
+
+                        // i64 partial load operations
+                        OP_I64_LOAD8_S: begin
+                            stack_pop_en <= 1'b1;
+                            effective_addr_full = {1'b0, operand_a.value[31:0]} + {1'b0, saved_decoded.immediate2};
+                            effective_addr_overflow = effective_addr_full[32];
+                            effective_addr = effective_addr_full[31:0];
+                            if (effective_addr_overflow) begin
+                                trap_code <= TRAP_OUT_OF_BOUNDS;
+                                state <= STATE_TRAP;
+                            end else begin
+                                mem_rd_en <= 1'b1;
+                                mem_rd_addr <= effective_addr;
+                                mem_rd_op <= MEM_LOAD_I8_S;
+                                state <= STATE_MEMORY;
+                            end
+                        end
+
+                        OP_I64_LOAD8_U: begin
+                            stack_pop_en <= 1'b1;
+                            effective_addr_full = {1'b0, operand_a.value[31:0]} + {1'b0, saved_decoded.immediate2};
+                            effective_addr_overflow = effective_addr_full[32];
+                            effective_addr = effective_addr_full[31:0];
+                            if (effective_addr_overflow) begin
+                                trap_code <= TRAP_OUT_OF_BOUNDS;
+                                state <= STATE_TRAP;
+                            end else begin
+                                mem_rd_en <= 1'b1;
+                                mem_rd_addr <= effective_addr;
+                                mem_rd_op <= MEM_LOAD_I8_U;
+                                state <= STATE_MEMORY;
+                            end
+                        end
+
+                        OP_I64_LOAD16_S: begin
+                            stack_pop_en <= 1'b1;
+                            effective_addr_full = {1'b0, operand_a.value[31:0]} + {1'b0, saved_decoded.immediate2};
+                            effective_addr_overflow = effective_addr_full[32];
+                            effective_addr = effective_addr_full[31:0];
+                            if (effective_addr_overflow) begin
+                                trap_code <= TRAP_OUT_OF_BOUNDS;
+                                state <= STATE_TRAP;
+                            end else begin
+                                mem_rd_en <= 1'b1;
+                                mem_rd_addr <= effective_addr;
+                                mem_rd_op <= MEM_LOAD_I16_S;
+                                state <= STATE_MEMORY;
+                            end
+                        end
+
+                        OP_I64_LOAD16_U: begin
+                            stack_pop_en <= 1'b1;
+                            effective_addr_full = {1'b0, operand_a.value[31:0]} + {1'b0, saved_decoded.immediate2};
+                            effective_addr_overflow = effective_addr_full[32];
+                            effective_addr = effective_addr_full[31:0];
+                            if (effective_addr_overflow) begin
+                                trap_code <= TRAP_OUT_OF_BOUNDS;
+                                state <= STATE_TRAP;
+                            end else begin
+                                mem_rd_en <= 1'b1;
+                                mem_rd_addr <= effective_addr;
+                                mem_rd_op <= MEM_LOAD_I16_U;
+                                state <= STATE_MEMORY;
+                            end
+                        end
+
+                        OP_I64_LOAD32_S: begin
+                            stack_pop_en <= 1'b1;
+                            effective_addr_full = {1'b0, operand_a.value[31:0]} + {1'b0, saved_decoded.immediate2};
+                            effective_addr_overflow = effective_addr_full[32];
+                            effective_addr = effective_addr_full[31:0];
+                            if (effective_addr_overflow) begin
+                                trap_code <= TRAP_OUT_OF_BOUNDS;
+                                state <= STATE_TRAP;
+                            end else begin
+                                mem_rd_en <= 1'b1;
+                                mem_rd_addr <= effective_addr;
+                                mem_rd_op <= MEM_LOAD_I32_S;
+                                state <= STATE_MEMORY;
+                            end
+                        end
+
+                        OP_I64_LOAD32_U: begin
+                            stack_pop_en <= 1'b1;
+                            effective_addr_full = {1'b0, operand_a.value[31:0]} + {1'b0, saved_decoded.immediate2};
+                            effective_addr_overflow = effective_addr_full[32];
+                            effective_addr = effective_addr_full[31:0];
+                            if (effective_addr_overflow) begin
+                                trap_code <= TRAP_OUT_OF_BOUNDS;
+                                state <= STATE_TRAP;
+                            end else begin
+                                mem_rd_en <= 1'b1;
+                                mem_rd_addr <= effective_addr;
+                                mem_rd_op <= MEM_LOAD_I32_U;
+                                state <= STATE_MEMORY;
+                            end
+                        end
+
+                        OP_I32_STORE: begin
+                            stack_pop_en <= 1'b1;
+                            effective_addr_full = {1'b0, operand_b.value[31:0]} + {1'b0, saved_decoded.immediate2};
+                            effective_addr_overflow = effective_addr_full[32];
+                            effective_addr = effective_addr_full[31:0];
+                            if (effective_addr_overflow) begin
+                                trap_code <= TRAP_OUT_OF_BOUNDS;
+                                state <= STATE_TRAP;
+                            end else begin
+                                mem_wr_en <= 1'b1;
+                                mem_wr_addr <= effective_addr;
+                                mem_wr_op <= MEM_STORE_I32;
+                                mem_wr_data <= operand_a.value;
+                                pc <= saved_next_pc;
+                                state <= STATE_FETCH;
+                            end
+                        end
+
+                        OP_I64_STORE: begin
+                            stack_pop_en <= 1'b1;
+                            effective_addr_full = {1'b0, operand_b.value[31:0]} + {1'b0, saved_decoded.immediate2};
+                            effective_addr_overflow = effective_addr_full[32];
+                            effective_addr = effective_addr_full[31:0];
+                            if (effective_addr_overflow) begin
+                                trap_code <= TRAP_OUT_OF_BOUNDS;
+                                state <= STATE_TRAP;
+                            end else begin
+                                mem_wr_en <= 1'b1;
+                                mem_wr_addr <= effective_addr;
+                                mem_wr_op <= MEM_STORE_I64;
+                                mem_wr_data <= operand_a.value;
+                                pc <= saved_next_pc;
+                                state <= STATE_FETCH;
+                            end
+                        end
+
+                        OP_I32_STORE8: begin
+                            stack_pop_en <= 1'b1;
+                            effective_addr_full = {1'b0, operand_b.value[31:0]} + {1'b0, saved_decoded.immediate2};
+                            effective_addr_overflow = effective_addr_full[32];
+                            effective_addr = effective_addr_full[31:0];
+                            if (effective_addr_overflow) begin
+                                trap_code <= TRAP_OUT_OF_BOUNDS;
+                                state <= STATE_TRAP;
+                            end else begin
+                                mem_wr_en <= 1'b1;
+                                mem_wr_addr <= effective_addr;
+                                mem_wr_op <= MEM_STORE_I8;
+                                mem_wr_data <= {56'b0, operand_a.value[7:0]};
+                                pc <= saved_next_pc;
+                                state <= STATE_FETCH;
+                            end
+                        end
+
+                        OP_I32_STORE16: begin
+                            stack_pop_en <= 1'b1;
+                            effective_addr_full = {1'b0, operand_b.value[31:0]} + {1'b0, saved_decoded.immediate2};
+                            effective_addr_overflow = effective_addr_full[32];
+                            effective_addr = effective_addr_full[31:0];
+                            if (effective_addr_overflow) begin
+                                trap_code <= TRAP_OUT_OF_BOUNDS;
+                                state <= STATE_TRAP;
+                            end else begin
+                                mem_wr_en <= 1'b1;
+                                mem_wr_addr <= effective_addr;
+                                mem_wr_op <= MEM_STORE_I16;
+                                mem_wr_data <= {48'b0, operand_a.value[15:0]};
+                                pc <= saved_next_pc;
+                                state <= STATE_FETCH;
+                            end
+                        end
+
+                        OP_I64_STORE8: begin
+                            stack_pop_en <= 1'b1;
+                            effective_addr_full = {1'b0, operand_b.value[31:0]} + {1'b0, saved_decoded.immediate2};
+                            effective_addr_overflow = effective_addr_full[32];
+                            effective_addr = effective_addr_full[31:0];
+                            if (effective_addr_overflow) begin
+                                trap_code <= TRAP_OUT_OF_BOUNDS;
+                                state <= STATE_TRAP;
+                            end else begin
+                                mem_wr_en <= 1'b1;
+                                mem_wr_addr <= effective_addr;
+                                mem_wr_op <= MEM_STORE_I8;
+                                mem_wr_data <= {56'b0, operand_a.value[7:0]};
+                                pc <= saved_next_pc;
+                                state <= STATE_FETCH;
+                            end
+                        end
+
+                        OP_I64_STORE16: begin
+                            stack_pop_en <= 1'b1;
+                            effective_addr_full = {1'b0, operand_b.value[31:0]} + {1'b0, saved_decoded.immediate2};
+                            effective_addr_overflow = effective_addr_full[32];
+                            effective_addr = effective_addr_full[31:0];
+                            if (effective_addr_overflow) begin
+                                trap_code <= TRAP_OUT_OF_BOUNDS;
+                                state <= STATE_TRAP;
+                            end else begin
+                                mem_wr_en <= 1'b1;
+                                mem_wr_addr <= effective_addr;
+                                mem_wr_op <= MEM_STORE_I16;
+                                mem_wr_data <= {48'b0, operand_a.value[15:0]};
+                                pc <= saved_next_pc;
+                                state <= STATE_FETCH;
+                            end
+                        end
+
+                        OP_I64_STORE32: begin
+                            stack_pop_en <= 1'b1;
+                            effective_addr_full = {1'b0, operand_b.value[31:0]} + {1'b0, saved_decoded.immediate2};
+                            effective_addr_overflow = effective_addr_full[32];
+                            effective_addr = effective_addr_full[31:0];
+                            if (effective_addr_overflow) begin
+                                trap_code <= TRAP_OUT_OF_BOUNDS;
+                                state <= STATE_TRAP;
+                            end else begin
+                                mem_wr_en <= 1'b1;
+                                mem_wr_addr <= effective_addr;
+                                mem_wr_op <= MEM_STORE_I32_FROM_I64;
+                                mem_wr_data <= {32'b0, operand_a.value[31:0]};
+                                pc <= saved_next_pc;
+                                state <= STATE_FETCH;
+                            end
+                        end
+
+                        OP_MEMORY_SIZE: begin
+                            stack_push_en <= 1'b1;
+                            stack_push_data.vtype <= TYPE_I32;
+                            stack_push_data.value <= {32'b0, mem_current_pages};
+                            pc <= saved_next_pc;
+                            state <= STATE_FETCH;
+                        end
+
+                        OP_MEMORY_GROW: begin
+                            stack_pop_en <= 1'b1;
+                            mem_grow_en <= 1'b1;
+                            mem_grow_pages <= operand_a.value[31:0];
+                            state <= STATE_MEMORY;
+                        end
+
+                        // ==== Numeric Constants ====
+                        OP_I32_CONST: begin
+                            stack_push_en <= 1'b1;
+                            stack_push_data.vtype <= TYPE_I32;
+                            stack_push_data.value <= {{32{saved_decoded.immediate[31]}}, saved_decoded.immediate[31:0]};
+                            pc <= saved_next_pc;
+                            state <= STATE_FETCH;
+                        end
+
+                        OP_I64_CONST: begin
+                            stack_push_en <= 1'b1;
+                            stack_push_data.vtype <= TYPE_I64;
+                            stack_push_data.value <= saved_decoded.immediate;
+                            pc <= saved_next_pc;
+                            state <= STATE_FETCH;
+                        end
+
+                        OP_F32_CONST: begin
+                            stack_push_en <= 1'b1;
+                            stack_push_data.vtype <= TYPE_F32;
+                            stack_push_data.value <= {32'b0, saved_decoded.immediate[31:0]};
+                            pc <= saved_next_pc;
+                            state <= STATE_FETCH;
+                        end
+
+                        OP_F64_CONST: begin
+                            stack_push_en <= 1'b1;
+                            stack_push_data.vtype <= TYPE_F64;
+                            stack_push_data.value <= saved_decoded.immediate;
+                            pc <= saved_next_pc;
+                            state <= STATE_FETCH;
+                        end
+
+                        // ==== i32 Comparison Operations ====
+                        OP_I32_EQZ: begin
+                            stack_pop_en <= 1'b1;
+                            stack_push_en <= 1'b1;
+                            stack_push_data.vtype <= TYPE_I32;
+                            stack_push_data.value <= {63'b0, operand_a.value[31:0] == 32'h0};
+                            pc <= saved_next_pc;
+                            state <= STATE_FETCH;
+                        end
+
+                        OP_I32_EQ, OP_I32_NE, OP_I32_LT_S, OP_I32_LT_U,
+                        OP_I32_GT_S, OP_I32_GT_U, OP_I32_LE_S, OP_I32_LE_U,
+                        OP_I32_GE_S, OP_I32_GE_U: begin
+                            stack_multi_pop_en <= 1'b1;
+                            stack_multi_pop_count <= 8'd2;
+                            alu_i32_valid_in <= 1'b1;
+                            alu_i32_a <= operand_b.value[31:0];  // First operand (deeper in stack)
+                            alu_i32_b <= operand_a.value[31:0];  // Second operand (TOS)
+
+                            case (saved_decoded.opcode)
+                                OP_I32_EQ:   alu_i32_op <= ALU_EQ;
+                                OP_I32_NE:   alu_i32_op <= ALU_NE;
+                                OP_I32_LT_S: alu_i32_op <= ALU_LT_S;
+                                OP_I32_LT_U: alu_i32_op <= ALU_LT_U;
+                                OP_I32_GT_S: alu_i32_op <= ALU_GT_S;
+                                OP_I32_GT_U: alu_i32_op <= ALU_GT_U;
+                                OP_I32_LE_S: alu_i32_op <= ALU_LE_S;
+                                OP_I32_LE_U: alu_i32_op <= ALU_LE_U;
+                                OP_I32_GE_S: alu_i32_op <= ALU_GE_S;
+                                OP_I32_GE_U: alu_i32_op <= ALU_GE_U;
+                                default:     alu_i32_op <= ALU_EQ;
+                            endcase
+                            state <= STATE_WRITEBACK;
+                        end
+
+                        // ==== i32 Unary Operations ====
+                        OP_I32_CLZ, OP_I32_CTZ, OP_I32_POPCNT: begin
+                            stack_pop_en <= 1'b1;
+                            alu_i32_valid_in <= 1'b1;
+                            alu_i32_a <= operand_a.value[31:0];
+                            alu_i32_b <= 32'h0;
+
+                            case (saved_decoded.opcode)
+                                OP_I32_CLZ:    alu_i32_op <= ALU_CLZ;
+                                OP_I32_CTZ:    alu_i32_op <= ALU_CTZ;
+                                OP_I32_POPCNT: alu_i32_op <= ALU_POPCNT;
+                                default:       alu_i32_op <= ALU_CLZ;
+                            endcase
+                            state <= STATE_WRITEBACK;
+                        end
+
+                        // ==== i32 Binary Operations ====
+                        OP_I32_ADD, OP_I32_SUB, OP_I32_MUL, OP_I32_DIV_S, OP_I32_DIV_U,
+                        OP_I32_REM_S, OP_I32_REM_U, OP_I32_AND, OP_I32_OR, OP_I32_XOR,
+                        OP_I32_SHL, OP_I32_SHR_S, OP_I32_SHR_U, OP_I32_ROTL, OP_I32_ROTR: begin
+                            stack_multi_pop_en <= 1'b1;
+                            stack_multi_pop_count <= 8'd2;
+                            alu_i32_valid_in <= 1'b1;
+                            alu_i32_a <= operand_b.value[31:0];
+                            alu_i32_b <= operand_a.value[31:0];
+
+                            case (saved_decoded.opcode)
+                                OP_I32_ADD:   alu_i32_op <= ALU_ADD;
+                                OP_I32_SUB:   alu_i32_op <= ALU_SUB;
+                                OP_I32_MUL:   alu_i32_op <= ALU_MUL;
+                                OP_I32_DIV_S: alu_i32_op <= ALU_DIV_S;
+                                OP_I32_DIV_U: alu_i32_op <= ALU_DIV_U;
+                                OP_I32_REM_S: alu_i32_op <= ALU_REM_S;
+                                OP_I32_REM_U: alu_i32_op <= ALU_REM_U;
+                                OP_I32_AND:   alu_i32_op <= ALU_AND;
+                                OP_I32_OR:    alu_i32_op <= ALU_OR;
+                                OP_I32_XOR:   alu_i32_op <= ALU_XOR;
+                                OP_I32_SHL:   alu_i32_op <= ALU_SHL;
+                                OP_I32_SHR_S: alu_i32_op <= ALU_SHR_S;
+                                OP_I32_SHR_U: alu_i32_op <= ALU_SHR_U;
+                                OP_I32_ROTL:  alu_i32_op <= ALU_ROTL;
+                                OP_I32_ROTR:  alu_i32_op <= ALU_ROTR;
+                                default:      alu_i32_op <= ALU_ADD;
+                            endcase
+                            state <= STATE_WRITEBACK;
+                        end
+
+                        // ==== i64 Operations ====
+                        OP_I64_EQZ: begin
+                            stack_pop_en <= 1'b1;
+                            stack_push_en <= 1'b1;
+                            stack_push_data.vtype <= TYPE_I32;
+                            stack_push_data.value <= {63'b0, operand_a.value == 64'h0};
+                            pc <= saved_next_pc;
+                            state <= STATE_FETCH;
+                        end
+
+                        OP_I64_EQ, OP_I64_NE, OP_I64_LT_S, OP_I64_LT_U,
+                        OP_I64_GT_S, OP_I64_GT_U, OP_I64_LE_S, OP_I64_LE_U,
+                        OP_I64_GE_S, OP_I64_GE_U: begin
+                            stack_multi_pop_en <= 1'b1;
+                            stack_multi_pop_count <= 8'd2;
+                            alu_i64_valid_in <= 1'b1;
+                            alu_i64_a <= operand_b.value;
+                            alu_i64_b <= operand_a.value;
+
+                            case (saved_decoded.opcode)
+                                OP_I64_EQ:   alu_i64_op <= ALU_EQ;
+                                OP_I64_NE:   alu_i64_op <= ALU_NE;
+                                OP_I64_LT_S: alu_i64_op <= ALU_LT_S;
+                                OP_I64_LT_U: alu_i64_op <= ALU_LT_U;
+                                OP_I64_GT_S: alu_i64_op <= ALU_GT_S;
+                                OP_I64_GT_U: alu_i64_op <= ALU_GT_U;
+                                OP_I64_LE_S: alu_i64_op <= ALU_LE_S;
+                                OP_I64_LE_U: alu_i64_op <= ALU_LE_U;
+                                OP_I64_GE_S: alu_i64_op <= ALU_GE_S;
+                                OP_I64_GE_U: alu_i64_op <= ALU_GE_U;
+                                default:     alu_i64_op <= ALU_EQ;
+                            endcase
+                            state <= STATE_WRITEBACK;
+                        end
+
+                        OP_I64_CLZ, OP_I64_CTZ, OP_I64_POPCNT: begin
+                            stack_pop_en <= 1'b1;
+                            alu_i64_valid_in <= 1'b1;
+                            alu_i64_a <= operand_a.value;
+                            alu_i64_b <= 64'h0;
+
+                            case (saved_decoded.opcode)
+                                OP_I64_CLZ:    alu_i64_op <= ALU_CLZ;
+                                OP_I64_CTZ:    alu_i64_op <= ALU_CTZ;
+                                OP_I64_POPCNT: alu_i64_op <= ALU_POPCNT;
+                                default:       alu_i64_op <= ALU_CLZ;
+                            endcase
+                            state <= STATE_WRITEBACK;
+                        end
+
+                        OP_I64_ADD, OP_I64_SUB, OP_I64_MUL, OP_I64_DIV_S, OP_I64_DIV_U,
+                        OP_I64_REM_S, OP_I64_REM_U, OP_I64_AND, OP_I64_OR, OP_I64_XOR,
+                        OP_I64_SHL, OP_I64_SHR_S, OP_I64_SHR_U, OP_I64_ROTL, OP_I64_ROTR: begin
+                            stack_multi_pop_en <= 1'b1;
+                            stack_multi_pop_count <= 8'd2;
+                            alu_i64_valid_in <= 1'b1;
+                            alu_i64_a <= operand_b.value;
+                            alu_i64_b <= operand_a.value;
+
+                            case (saved_decoded.opcode)
+                                OP_I64_ADD:   alu_i64_op <= ALU_ADD;
+                                OP_I64_SUB:   alu_i64_op <= ALU_SUB;
+                                OP_I64_MUL:   alu_i64_op <= ALU_MUL;
+                                OP_I64_DIV_S: alu_i64_op <= ALU_DIV_S;
+                                OP_I64_DIV_U: alu_i64_op <= ALU_DIV_U;
+                                OP_I64_REM_S: alu_i64_op <= ALU_REM_S;
+                                OP_I64_REM_U: alu_i64_op <= ALU_REM_U;
+                                OP_I64_AND:   alu_i64_op <= ALU_AND;
+                                OP_I64_OR:    alu_i64_op <= ALU_OR;
+                                OP_I64_XOR:   alu_i64_op <= ALU_XOR;
+                                OP_I64_SHL:   alu_i64_op <= ALU_SHL;
+                                OP_I64_SHR_S: alu_i64_op <= ALU_SHR_S;
+                                OP_I64_SHR_U: alu_i64_op <= ALU_SHR_U;
+                                OP_I64_ROTL:  alu_i64_op <= ALU_ROTL;
+                                OP_I64_ROTR:  alu_i64_op <= ALU_ROTR;
+                                default:      alu_i64_op <= ALU_ADD;
+                            endcase
+                            state <= STATE_WRITEBACK;
+                        end
+
+                        // ==== f32 Operations ====
+                        OP_F32_EQ, OP_F32_NE, OP_F32_LT, OP_F32_GT, OP_F32_LE, OP_F32_GE: begin
+                            stack_multi_pop_en <= 1'b1;
+                            stack_multi_pop_count <= 8'd2;
+                            fpu_f32_valid_in <= 1'b1;
+                            fpu_f32_a <= operand_b.value[31:0];
+                            fpu_f32_b <= operand_a.value[31:0];
+
+                            case (saved_decoded.opcode)
+                                OP_F32_EQ: fpu_f32_op <= FPU_EQ;
+                                OP_F32_NE: fpu_f32_op <= FPU_NE;
+                                OP_F32_LT: fpu_f32_op <= FPU_LT;
+                                OP_F32_GT: fpu_f32_op <= FPU_GT;
+                                OP_F32_LE: fpu_f32_op <= FPU_LE;
+                                OP_F32_GE: fpu_f32_op <= FPU_GE;
+                                default:   fpu_f32_op <= FPU_EQ;
+                            endcase
+                            state <= STATE_WRITEBACK;
+                        end
+
+                        OP_F32_ABS, OP_F32_NEG, OP_F32_CEIL, OP_F32_FLOOR,
+                        OP_F32_TRUNC, OP_F32_NEAREST, OP_F32_SQRT: begin
+                            stack_pop_en <= 1'b1;
+                            fpu_f32_valid_in <= 1'b1;
+                            fpu_f32_a <= operand_a.value[31:0];
+                            fpu_f32_b <= 32'h0;
+
+                            case (saved_decoded.opcode)
+                                OP_F32_ABS:     fpu_f32_op <= FPU_ABS;
+                                OP_F32_NEG:     fpu_f32_op <= FPU_NEG;
+                                OP_F32_CEIL:    fpu_f32_op <= FPU_CEIL;
+                                OP_F32_FLOOR:   fpu_f32_op <= FPU_FLOOR;
+                                OP_F32_TRUNC:   fpu_f32_op <= FPU_TRUNC;
+                                OP_F32_NEAREST: fpu_f32_op <= FPU_NEAREST;
+                                OP_F32_SQRT:    fpu_f32_op <= FPU_SQRT;
+                                default:        fpu_f32_op <= FPU_ABS;
+                            endcase
+                            state <= STATE_WRITEBACK;
+                        end
+
+                        OP_F32_ADD, OP_F32_SUB, OP_F32_MUL, OP_F32_DIV,
+                        OP_F32_MIN, OP_F32_MAX, OP_F32_COPYSIGN: begin
+                            stack_multi_pop_en <= 1'b1;
+                            stack_multi_pop_count <= 8'd2;
+                            fpu_f32_valid_in <= 1'b1;
+                            fpu_f32_a <= operand_b.value[31:0];
+                            fpu_f32_b <= operand_a.value[31:0];
+
+                            case (saved_decoded.opcode)
+                                OP_F32_ADD:      fpu_f32_op <= FPU_ADD;
+                                OP_F32_SUB:      fpu_f32_op <= FPU_SUB;
+                                OP_F32_MUL:      fpu_f32_op <= FPU_MUL;
+                                OP_F32_DIV:      fpu_f32_op <= FPU_DIV;
+                                OP_F32_MIN:      fpu_f32_op <= FPU_MIN;
+                                OP_F32_MAX:      fpu_f32_op <= FPU_MAX;
+                                OP_F32_COPYSIGN: fpu_f32_op <= FPU_COPYSIGN;
+                                default:         fpu_f32_op <= FPU_ADD;
+                            endcase
+                            state <= STATE_WRITEBACK;
+                        end
+
+                        // ==== f64 Operations ====
+                        OP_F64_EQ, OP_F64_NE, OP_F64_LT, OP_F64_GT, OP_F64_LE, OP_F64_GE: begin
+                            stack_multi_pop_en <= 1'b1;
+                            stack_multi_pop_count <= 8'd2;
+                            fpu_f64_valid_in <= 1'b1;
+                            fpu_f64_a <= operand_b.value;
+                            fpu_f64_b <= operand_a.value;
+
+                            case (saved_decoded.opcode)
+                                OP_F64_EQ: fpu_f64_op <= FPU_EQ;
+                                OP_F64_NE: fpu_f64_op <= FPU_NE;
+                                OP_F64_LT: fpu_f64_op <= FPU_LT;
+                                OP_F64_GT: fpu_f64_op <= FPU_GT;
+                                OP_F64_LE: fpu_f64_op <= FPU_LE;
+                                OP_F64_GE: fpu_f64_op <= FPU_GE;
+                                default:   fpu_f64_op <= FPU_EQ;
+                            endcase
+                            state <= STATE_WRITEBACK;
+                        end
+
+                        OP_F64_ABS, OP_F64_NEG, OP_F64_CEIL, OP_F64_FLOOR,
+                        OP_F64_TRUNC, OP_F64_NEAREST, OP_F64_SQRT: begin
+                            stack_pop_en <= 1'b1;
+                            fpu_f64_valid_in <= 1'b1;
+                            fpu_f64_a <= operand_a.value;
+                            fpu_f64_b <= 64'h0;
+
+                            case (saved_decoded.opcode)
+                                OP_F64_ABS:     fpu_f64_op <= FPU_ABS;
+                                OP_F64_NEG:     fpu_f64_op <= FPU_NEG;
+                                OP_F64_CEIL:    fpu_f64_op <= FPU_CEIL;
+                                OP_F64_FLOOR:   fpu_f64_op <= FPU_FLOOR;
+                                OP_F64_TRUNC:   fpu_f64_op <= FPU_TRUNC;
+                                OP_F64_NEAREST: fpu_f64_op <= FPU_NEAREST;
+                                OP_F64_SQRT:    fpu_f64_op <= FPU_SQRT;
+                                default:        fpu_f64_op <= FPU_ABS;
+                            endcase
+                            state <= STATE_WRITEBACK;
+                        end
+
+                        OP_F64_ADD, OP_F64_SUB, OP_F64_MUL, OP_F64_DIV,
+                        OP_F64_MIN, OP_F64_MAX, OP_F64_COPYSIGN: begin
+                            stack_multi_pop_en <= 1'b1;
+                            stack_multi_pop_count <= 8'd2;
+                            fpu_f64_valid_in <= 1'b1;
+                            fpu_f64_a <= operand_b.value;
+                            fpu_f64_b <= operand_a.value;
+
+                            case (saved_decoded.opcode)
+                                OP_F64_ADD:      fpu_f64_op <= FPU_ADD;
+                                OP_F64_SUB:      fpu_f64_op <= FPU_SUB;
+                                OP_F64_MUL:      fpu_f64_op <= FPU_MUL;
+                                OP_F64_DIV:      fpu_f64_op <= FPU_DIV;
+                                OP_F64_MIN:      fpu_f64_op <= FPU_MIN;
+                                OP_F64_MAX:      fpu_f64_op <= FPU_MAX;
+                                OP_F64_COPYSIGN: fpu_f64_op <= FPU_COPYSIGN;
+                                default:         fpu_f64_op <= FPU_ADD;
+                            endcase
+                            state <= STATE_WRITEBACK;
+                        end
+
+                        // ==== Conversions ====
+                        OP_I32_WRAP_I64, OP_I32_TRUNC_F32_S, OP_I32_TRUNC_F32_U,
+                        OP_I32_TRUNC_F64_S, OP_I32_TRUNC_F64_U,
+                        OP_I64_EXTEND_I32_S, OP_I64_EXTEND_I32_U,
+                        OP_I64_TRUNC_F32_S, OP_I64_TRUNC_F32_U,
+                        OP_I64_TRUNC_F64_S, OP_I64_TRUNC_F64_U,
+                        OP_F32_CONVERT_I32_S, OP_F32_CONVERT_I32_U,
+                        OP_F32_CONVERT_I64_S, OP_F32_CONVERT_I64_U,
+                        OP_F32_DEMOTE_F64,
+                        OP_F64_CONVERT_I32_S, OP_F64_CONVERT_I32_U,
+                        OP_F64_CONVERT_I64_S, OP_F64_CONVERT_I64_U,
+                        OP_F64_PROMOTE_F32,
+                        OP_I32_REINTERPRET_F32, OP_I64_REINTERPRET_F64,
+                        OP_F32_REINTERPRET_I32, OP_F64_REINTERPRET_I64,
+                        OP_I32_EXTEND8_S, OP_I32_EXTEND16_S,
+                        OP_I64_EXTEND8_S, OP_I64_EXTEND16_S, OP_I64_EXTEND32_S: begin
+                            stack_pop_en <= 1'b1;
+                            conv_valid_in <= 1'b1;
+                            conv_op <= saved_decoded.opcode;
+                            conv_operand <= operand_a.value;
+                            state <= STATE_WRITEBACK;
+                        end
+
+                        // Extended opcodes (0xFC prefix) - trunc_sat
+                        OP_PREFIX_FC: begin
+                            // immediate[7:0] contains the sub-opcode
+                            // 0x00-0x07 are trunc_sat operations
+                            if (saved_decoded.immediate[7:0] <= 8'd7) begin
+                                stack_pop_en <= 1'b1;
+                                conv_valid_in <= 1'b1;
+                                conv_op <= OP_PREFIX_FC;
+                                conv_sub_op <= saved_decoded.immediate[7:0];
+                                conv_operand <= operand_a.value;
+                                state <= STATE_WRITEBACK;
+                            end else begin
+                                // Other 0xFC opcodes not implemented
+                                pc <= saved_next_pc;
+                                state <= STATE_FETCH;
+                            end
+                        end
+
+                        default: begin
+                            // Unknown opcode - just skip
+                            pc <= saved_next_pc;
+                            state <= STATE_FETCH;
+                        end
+                    endcase
+                end
+
+                STATE_MEMORY: begin
+                    // Wait for memory operations
+                    if (local_rd_valid) begin
+                        stack_push_en <= 1'b1;
+                        stack_push_data <= local_rd_data;
+                        pc <= saved_next_pc;
+                        state <= STATE_FETCH;
+                    end
+                    else if (global_rd_valid) begin
+                        stack_push_en <= 1'b1;
+                        stack_push_data <= global_rd_data;
+                        pc <= saved_next_pc;
+                        state <= STATE_FETCH;
+                    end
+                    else if (mem_rd_valid) begin
+                        stack_push_en <= 1'b1;
+                        case (saved_decoded.opcode)
+                            OP_I32_LOAD, OP_I32_LOAD8_S, OP_I32_LOAD8_U,
+                            OP_I32_LOAD16_S, OP_I32_LOAD16_U: begin
+                                stack_push_data.vtype <= TYPE_I32;
+                            end
+                            OP_I64_LOAD, OP_I64_LOAD8_S, OP_I64_LOAD8_U,
+                            OP_I64_LOAD16_S, OP_I64_LOAD16_U,
+                            OP_I64_LOAD32_S, OP_I64_LOAD32_U: begin
+                                stack_push_data.vtype <= TYPE_I64;
+                            end
+                            OP_F32_LOAD: begin
+                                stack_push_data.vtype <= TYPE_F32;
+                            end
+                            OP_F64_LOAD: begin
+                                stack_push_data.vtype <= TYPE_F64;
+                            end
+                            default: stack_push_data.vtype <= TYPE_I32;
+                        endcase
+                        stack_push_data.value <= mem_rd_data;
+                        pc <= saved_next_pc;
+                        state <= STATE_FETCH;
+                    end
+                    else if (mem_trap != TRAP_NONE) begin
+                        trapped <= 1'b1;
+                        trap_code <= mem_trap;
+                        state <= STATE_TRAP;
+                    end
+                    else if (saved_decoded.opcode == OP_MEMORY_GROW && !mem_grow_en) begin
+                        // Memory grow result ready (wait one cycle after grow_en deasserted)
+                        stack_push_en <= 1'b1;
+                        stack_push_data.vtype <= TYPE_I32;
+                        stack_push_data.value <= {32'b0, mem_grow_result};
+                        pc <= saved_next_pc;
+                        state <= STATE_FETCH;
+                    end
+                end
+
+                STATE_WRITEBACK: begin
+                    // Push ALU/FPU results to stack
+                    stack_push_en <= 1'b1;
+
+                    if (alu_i32_valid_out) begin
+                        if (alu_i32_trap != TRAP_NONE) begin
+                            trapped <= 1'b1;
+                            trap_code <= alu_i32_trap;
+                            state <= STATE_TRAP;
+                        end else begin
+                            stack_push_data.vtype <= TYPE_I32;
+                            stack_push_data.value <= {32'b0, alu_i32_result};
+                            pc <= saved_next_pc;
+                            state <= STATE_FETCH;
+                        end
+                    end
+                    else if (alu_i64_valid_out) begin
+                        if (alu_i64_trap != TRAP_NONE) begin
+                            trapped <= 1'b1;
+                            trap_code <= alu_i64_trap;
+                            state <= STATE_TRAP;
+                        end else begin
+                            // i64 comparison returns i32
+                            case (saved_decoded.opcode)
+                                OP_I64_EQ, OP_I64_NE, OP_I64_LT_S, OP_I64_LT_U,
+                                OP_I64_GT_S, OP_I64_GT_U, OP_I64_LE_S, OP_I64_LE_U,
+                                OP_I64_GE_S, OP_I64_GE_U: begin
+                                    stack_push_data.vtype <= TYPE_I32;
+                                    stack_push_data.value <= {32'b0, alu_i64_result[31:0]};
+                                end
+                                default: begin
+                                    stack_push_data.vtype <= TYPE_I64;
+                                    stack_push_data.value <= alu_i64_result;
+                                end
+                            endcase
+                            pc <= saved_next_pc;
+                            state <= STATE_FETCH;
+                        end
+                    end
+                    else if (fpu_f32_valid_out) begin
+                        // f32 comparison returns i32
+                        case (saved_decoded.opcode)
+                            OP_F32_EQ, OP_F32_NE, OP_F32_LT, OP_F32_GT, OP_F32_LE, OP_F32_GE: begin
+                                stack_push_data.vtype <= TYPE_I32;
+                                stack_push_data.value <= {32'b0, fpu_f32_result};
+                            end
+                            default: begin
+                                stack_push_data.vtype <= TYPE_F32;
+                                stack_push_data.value <= {32'b0, fpu_f32_result};
+                            end
+                        endcase
+                        pc <= saved_next_pc;
+                        state <= STATE_FETCH;
+                    end
+                    else if (fpu_f64_valid_out) begin
+                        // f64 comparison returns i32
+                        case (saved_decoded.opcode)
+                            OP_F64_EQ, OP_F64_NE, OP_F64_LT, OP_F64_GT, OP_F64_LE, OP_F64_GE: begin
+                                stack_push_data.vtype <= TYPE_I32;
+                                stack_push_data.value <= {32'b0, fpu_f64_result[31:0]};
+                            end
+                            default: begin
+                                stack_push_data.vtype <= TYPE_F64;
+                                stack_push_data.value <= fpu_f64_result;
+                            end
+                        endcase
+                        pc <= saved_next_pc;
+                        state <= STATE_FETCH;
+                    end
+                    else if (conv_valid_out) begin
+                        if (conv_trap != TRAP_NONE) begin
+                            trapped <= 1'b1;
+                            trap_code <= conv_trap;
+                            state <= STATE_TRAP;
+                        end else begin
+                            case (saved_decoded.opcode)
+                                OP_I32_WRAP_I64, OP_I32_TRUNC_F32_S, OP_I32_TRUNC_F32_U,
+                                OP_I32_TRUNC_F64_S, OP_I32_TRUNC_F64_U,
+                                OP_I32_REINTERPRET_F32, OP_I32_EXTEND8_S, OP_I32_EXTEND16_S: begin
+                                    stack_push_data.vtype <= TYPE_I32;
+                                end
+                                OP_I64_EXTEND_I32_S, OP_I64_EXTEND_I32_U,
+                                OP_I64_TRUNC_F32_S, OP_I64_TRUNC_F32_U,
+                                OP_I64_TRUNC_F64_S, OP_I64_TRUNC_F64_U,
+                                OP_I64_REINTERPRET_F64, OP_I64_EXTEND8_S,
+                                OP_I64_EXTEND16_S, OP_I64_EXTEND32_S: begin
+                                    stack_push_data.vtype <= TYPE_I64;
+                                end
+                                OP_F32_CONVERT_I32_S, OP_F32_CONVERT_I32_U,
+                                OP_F32_CONVERT_I64_S, OP_F32_CONVERT_I64_U,
+                                OP_F32_DEMOTE_F64, OP_F32_REINTERPRET_I32: begin
+                                    stack_push_data.vtype <= TYPE_F32;
+                                end
+                                OP_F64_CONVERT_I32_S, OP_F64_CONVERT_I32_U,
+                                OP_F64_CONVERT_I64_S, OP_F64_CONVERT_I64_U,
+                                OP_F64_PROMOTE_F32, OP_F64_REINTERPRET_I64: begin
+                                    stack_push_data.vtype <= TYPE_F64;
+                                end
+                                OP_PREFIX_FC: begin
+                                    // trunc_sat: sub_op 0-3 return i32, 4-7 return i64
+                                    if (conv_sub_op <= 8'd3)
+                                        stack_push_data.vtype <= TYPE_I32;
+                                    else
+                                        stack_push_data.vtype <= TYPE_I64;
+                                end
+                                default: stack_push_data.vtype <= TYPE_I32;
+                            endcase
+                            stack_push_data.value <= conv_result;
+                            pc <= saved_next_pc;
+                            state <= STATE_FETCH;
+                        end
+                    end
+                    else if (saved_decoded.opcode == OP_SELECT || saved_decoded.opcode == OP_SELECT_T) begin
+                        // Select instruction - push the pre-computed result
+                        stack_push_data.vtype <= exec_result_type;
+                        stack_push_data.value <= exec_result;
+                        pc <= saved_next_pc;
+                        state <= STATE_FETCH;
+                    end
+                end
+
+                STATE_SCAN_ELSE: begin
+                    // Scan for else or end opcode (for if with false condition)
+                    // Use decoder to get instruction length
+                    logic [7:0] scan_byte;
+                    logic [31:0] skip_len;
+                    scan_byte = code_mem[pc];
+
+                    // Calculate skip length based on opcode
+                    case (scan_byte)
+                        8'h02, 8'h03, 8'h04: begin  // block, loop, if - increment depth
+                            scan_depth <= scan_depth + 1;
+                            skip_len = 2;  // opcode + blocktype
+                        end
+                        8'h05: begin  // else
+                            if (scan_depth == 0) begin
+                                // Found matching else - enter else block
+                                label_push_en <= 1'b1;
+                                label_push_data.target_pc <= 32'h0;
+                                label_push_data.stack_height <= stack_ptr;
+                                label_push_data.arity <= (saved_decoded.immediate == 64'hFFFFFFFF) ? 8'h0 : 8'h1;
+                                label_push_data.is_loop <= 1'b0;
+                                pc <= pc + 1;
+                                state <= STATE_FETCH;
+                            end else begin
+                                pc <= pc + 1;
+                            end
+                            skip_len = 0;  // Handled above
+                        end
+                        8'h0B: begin  // end - decrement depth or found target
+                            if (scan_depth == 0) begin
+                                pc <= pc + 1;
+                                state <= STATE_FETCH;
+                            end else begin
+                                scan_depth <= scan_depth - 1;
+                                pc <= pc + 1;
+                            end
+                            skip_len = 0;
+                        end
+                        // Instructions with LEB128 immediate
+                        8'h0C, 8'h0D: skip_len = 2;  // br, br_if (assume small label)
+                        8'h10: skip_len = 2;  // call (assume small index)
+                        8'h20, 8'h21, 8'h22, 8'h23, 8'h24: skip_len = 2;  // local/global ops
+                        8'h41: skip_len = 2;  // i32.const (assume small value)
+                        8'h42: skip_len = 2;  // i64.const (assume small value)
+                        8'h43: skip_len = 5;  // f32.const
+                        8'h44: skip_len = 9;  // f64.const
+                        8'h28, 8'h29, 8'h2A, 8'h2B, 8'h2C, 8'h2D, 8'h2E, 8'h2F,
+                        8'h30, 8'h31, 8'h32, 8'h33, 8'h34, 8'h35, 8'h36, 8'h37,
+                        8'h38, 8'h39, 8'h3A, 8'h3B, 8'h3C, 8'h3D, 8'h3E, 8'h3F,
+                        8'h40: skip_len = 3;  // memory ops (align + offset)
+                        default: skip_len = 1;  // Simple opcodes
+                    endcase
+
+                    if (skip_len != 0) pc <= pc + skip_len;
+                end
+
+                STATE_SCAN_END: begin
+                    // Scan for end opcode (for else block skip)
+                    logic [7:0] scan_byte;
+                    logic [31:0] skip_len;
+                    scan_byte = code_mem[pc];
+
+                    case (scan_byte)
+                        8'h02, 8'h03, 8'h04: begin  // block, loop, if
+                            scan_depth <= scan_depth + 1;
+                            skip_len = 2;
+                        end
+                        8'h0B: begin  // end
+                            if (scan_depth == 0) begin
+                                pc <= pc + 1;
+                                // Check if we need stack unwinding (branch) or not (else-skip)
+                                if (scan_needs_unwind) begin
+                                    state <= STATE_BR_UNWIND;
+                                end else begin
+                                    state <= STATE_FETCH;
+                                end
+                            end else begin
+                                scan_depth <= scan_depth - 1;
+                                pc <= pc + 1;
+                            end
+                            skip_len = 0;
+                        end
+                        8'h05: skip_len = 1;  // else (increment depth is implicit in if)
+                        8'h0C, 8'h0D: skip_len = 2;  // br, br_if
+                        8'h0E: begin  // br_table - variable length, need to scan
+                            // Switch to br_table scan state
+                            scan_br_table_start <= pc + 1;  // Start of count
+                            scan_br_table_remaining <= 32'hFFFFFFFF;  // Signal to read count
+                            state <= STATE_SCAN_BR_TABLE;
+                            skip_len = 0;
+                        end
+                        8'h10: skip_len = 2;
+                        8'h20, 8'h21, 8'h22, 8'h23, 8'h24: skip_len = 2;
+                        8'h41: skip_len = 2;
+                        8'h42: skip_len = 2;
+                        8'h43: skip_len = 5;
+                        8'h44: skip_len = 9;
+                        8'h28, 8'h29, 8'h2A, 8'h2B, 8'h2C, 8'h2D, 8'h2E, 8'h2F,
+                        8'h30, 8'h31, 8'h32, 8'h33, 8'h34, 8'h35, 8'h36, 8'h37,
+                        8'h38, 8'h39, 8'h3A, 8'h3B, 8'h3C, 8'h3D, 8'h3E, 8'h3F,
+                        8'h40: skip_len = 3;
+                        default: skip_len = 1;
+                    endcase
+
+                    if (skip_len != 0) pc <= pc + skip_len;
+                end
+
+                STATE_SCAN_BR_TABLE: begin
+                    // Scan through br_table to skip past it during STATE_SCAN_END
+                    // We need to skip: count (LEB128) + count * target_depth (LEB128) + default (LEB128)
+                    logic [7:0] sbt_byte;
+                    logic [31:0] sbt_count;
+                    logic [31:0] sbt_leb_len;
+
+                    sbt_byte = code_mem[scan_br_table_start];
+
+                    // Simple LEB128 decode for count
+                    if ((sbt_byte & 8'h80) == 0) begin
+                        sbt_count = {24'b0, sbt_byte};
+                        sbt_leb_len = 1;
+                    end else begin
+                        sbt_count = {17'b0, code_mem[scan_br_table_start + 1][6:0], sbt_byte[6:0]};
+                        sbt_leb_len = 2;
+                    end
+
+                    // First call: read count and set up for scanning targets
+                    if (scan_br_table_remaining == 32'hFFFFFFFF) begin
+                        scan_br_table_remaining <= sbt_count + 1;  // count targets + 1 default
+                        scan_br_table_start <= scan_br_table_start + sbt_leb_len;
+                    end else if (scan_br_table_remaining == 0) begin
+                        // Done - return to STATE_SCAN_END
+                        pc <= scan_br_table_start;
+                        state <= STATE_SCAN_END;
+                    end else begin
+                        // Skip one LEB128 target depth
+                        if ((sbt_byte & 8'h80) == 0) begin
+                            scan_br_table_start <= scan_br_table_start + 1;
+                        end else begin
+                            scan_br_table_start <= scan_br_table_start + 2;
+                        end
+                        scan_br_table_remaining <= scan_br_table_remaining - 1;
+                    end
+                end
+
+                STATE_BR_TABLE: begin
+                    // Process br_table targets
+                    // Read LEB128 target depth from code_mem[br_table_pc]
+                    logic [7:0] leb_byte0, leb_byte1;
+                    logic [31:0] target_depth;
+                    logic [31:0] leb_len;
+
+                    leb_byte0 = code_mem[br_table_pc];
+                    leb_byte1 = code_mem[br_table_pc + 1];
+
+                    // Simple LEB128 decode (handles up to 2 bytes, values up to 16383)
+                    if ((leb_byte0 & 8'h80) == 0) begin
+                        target_depth = {24'b0, leb_byte0};
+                        leb_len = 1;
+                    end else begin
+                        target_depth = {17'b0, leb_byte1[6:0], leb_byte0[6:0]};
+                        leb_len = 2;
+                    end
+
+                    // State machine for br_table processing
+                    if (br_table_current > br_table_count) begin
+                        // Phase 3: All targets processed, now branch
+                        // Check if branch targets function level
+                        logic [7:0] brt_func_label_count;
+                        logic brt_is_func_return;
+                        brt_func_label_count = label_stack_ptr - current_frame.label_height;
+                        brt_is_func_return = (br_table_depth >= brt_func_label_count);
+
+                        if (brt_is_func_return) begin
+                            // Branch to function block = return
+                            label_set_sp_en <= 1'b1;
+                            label_set_sp_value <= current_frame.label_height;
+                            branch_target_stack_height <= current_frame.stack_height;
+                            branch_target_arity <= current_frame.arity;
+                            branch_target_pc <= 32'hFFFFFFFF;
+                            // Save branch value (TOS) for STATE_BR_UNWIND
+                            branch_saved_value <= stack_pop_data;
+                            state <= STATE_BR_UNWIND;
+                        end else begin
+                            // Save target info for stack unwinding
+                            branch_target_stack_height <= label_branch_target.stack_height;
+                            branch_target_arity <= label_branch_target.arity;
+                            branch_target_pc <= label_branch_target.target_pc;
+
+                            if (label_branch_target.is_loop) begin
+                                // Loop: pop intermediate labels but keep loop's label
+                                if (br_table_depth > 0) begin
+                                    label_set_sp_en <= 1'b1;
+                                    label_set_sp_value <= label_stack_ptr - br_table_depth;
+                                end
+                                pc <= label_branch_target.target_pc;
+                                state <= STATE_FETCH;
+                            end else begin
+                                // Block: pop labels including target block
+                                label_branch_pop_en <= 1'b1;
+                                // Block - scan forward to find END
+                                scan_depth <= br_table_depth;
+                                scan_for_else <= 1'b0;
+                                scan_needs_unwind <= 1'b1;
+                                pc <= br_table_pc;
+                                state <= STATE_SCAN_END;
+                            end
+                        end
+                    end else if (br_table_current == br_table_count) begin
+                        // Phase 2: At the default target - this is the last one
+                        // Set br_table_depth to the final value we'll use
+                        if (br_table_index >= br_table_count) begin
+                            // Use default
+                            br_table_depth <= target_depth[7:0];
+                        end
+                        // If index < count, br_table_depth was already set, keep it
+
+                        // Save PC after br_table for next cycle
+                        br_table_pc <= br_table_pc + leb_len;
+                        br_table_current <= br_table_current + 1;
+                    end else begin
+                        // Phase 1: Scanning through targets
+                        // Check if we've found the target we want
+                        if (br_table_current == br_table_index) begin
+                            // Found our target - save the depth
+                            br_table_depth <= target_depth[7:0];
+                        end
+                        // Move to next target
+                        br_table_pc <= br_table_pc + leb_len;
+                        br_table_current <= br_table_current + 1;
+                    end
+                end
+
+                STATE_BR_UNWIND: begin
+                    // Unwind stack after branch to match target label's stack height
+                    // For arity > 0, we need to keep the top arity values
+                    logic need_collapse;
+                    logic [15:0] excess_values;
+                    logic is_func_return;
+                    logic [15:0] effective_sp;
+                    logic pop_was_pending;
+
+                    // Check if this is a branch to function block (return)
+                    // Use saved branch_target_pc since label stack has already been popped
+                    is_func_return = (branch_target_pc == 32'hFFFFFFFF);
+
+                    // Adjust stack_ptr for pending pop from br_if (hasn't taken effect yet on first cycle)
+                    effective_sp = branch_pop_pending ? (stack_ptr - 1) : stack_ptr;
+                    excess_values = effective_sp - branch_target_stack_height;
+                    need_collapse = (branch_target_arity > 0) && (excess_values > {8'b0, branch_target_arity});
+
+                    // Save whether pop is pending before we clear it
+                    pop_was_pending = branch_pop_pending;
+
+                    // Clear the pending flag after first use
+                    branch_pop_pending <= 1'b0;
+
+                    if (need_collapse) begin
+                        // Phase 1: Save TOS, collapse stack to target height
+                        // Only read from stack if pop wasn't pending - otherwise value is already saved
+                        if (!pop_was_pending) begin
+                            branch_saved_value <= stack_pop_data;
+                        end
+                        // When pop was pending, branch_saved_value was already set correctly by br_if
+                        stack_set_sp_en <= 1'b1;
+                        stack_set_sp_value <= branch_target_stack_height;
+                        branch_target_arity <= 8'hFF;  // Flag for phase 2
+                    end else if (branch_target_arity == 8'hFF) begin
+                        // Phase 2: Push the saved value back
+                        stack_push_en <= 1'b1;
+                        stack_push_data <= branch_saved_value;
+                        branch_target_arity <= 8'h0;
+                        if (is_func_return) begin
+                            // Function return via br
+                            result_valid <= 1'b1;
+                            result_value <= branch_saved_value;
+                            halted <= 1'b1;
+                            state <= STATE_HALT;
+                        end else begin
+                            state <= STATE_FETCH;
+                        end
+                    end else if (branch_target_arity == 0 && effective_sp > branch_target_stack_height) begin
+                        // Void block with extra values - restore stack height
+                        stack_set_sp_en <= 1'b1;
+                        stack_set_sp_value <= branch_target_stack_height;
+                        if (is_func_return) begin
+                            // Function return via br (void)
+                            halted <= 1'b1;
+                            state <= STATE_HALT;
+                        end else begin
+                            state <= STATE_FETCH;
+                        end
+                    end else begin
+                        // Stack already correct or arity matches excess
+                        if (is_func_return) begin
+                            // Function return via br
+                            if (branch_target_arity > 0) begin
+                                result_valid <= 1'b1;
+                                // Use branch_saved_value which was captured before any pops
+                                // (e.g., from br_if which pops condition before reaching here)
+                                result_value <= branch_saved_value;
+                            end
+                            halted <= 1'b1;
+                            state <= STATE_HALT;
+                        end else begin
+                            state <= STATE_FETCH;
+                        end
+                    end
+                end
+
+                STATE_TRAP: begin
+                    // Stay in trap state
+                    trapped <= 1'b1;
+                    halted <= 1'b1;
+                end
+
+                STATE_HALT: begin
+                    // Stay halted, but allow restart
+                    if (start) begin
+                        // Start execution at entry function
+                        pc <= func_table[entry_func].code_offset;
+                        state <= STATE_FETCH;
+                        halted <= 1'b0;
+                        trapped <= 1'b0;
+
+                        // Push implicit call frame for the entry function
+                        frame_push_en <= 1'b1;
+                        frame_push_data.return_pc <= 32'hFFFFFFFF;  // Special: no return
+                        frame_push_data.func_idx <= entry_func[15:0];
+                        frame_push_data.local_base <= 16'h0;
+                        frame_push_data.stack_height <= 16'h0;
+                        frame_push_data.label_height <= 8'h0;
+                        frame_push_data.arity <= func_table[entry_func].result_count;
+                    end
+                end
+
+                default: begin
+                    state <= STATE_IDLE;
+                end
+            endcase
+        end
+    end
+
+endmodule
