@@ -12,6 +12,7 @@ module wasm_memory
     // Initial memory configuration
     input  logic        init_en,        // Pulse to set initial size
     input  logic [31:0] init_pages,     // Initial page count
+    input  logic [31:0] init_max_pages, // Max pages (0 = use MAX_PAGES parameter)
 
     // Direct memory write for data segment initialization
     input  logic        data_wr_en,
@@ -49,6 +50,8 @@ module wasm_memory
 
     // Current number of pages
     logic [31:0] num_pages;
+    // Maximum pages (from WASM module, 0 means no limit beyond MAX_PAGES)
+    logic [31:0] max_pages;
 
     assign current_pages = num_pages;
 
@@ -60,11 +63,30 @@ module wasm_memory
         return !end_addr[32] && (end_addr[31:0] <= (num_pages * PAGE_SIZE));
     endfunction
 
-    // Read logic
+    // Read logic and trap detection (combinational)
     always_comb begin
         rd_data = 64'h0;
         rd_valid = 1'b0;
         trap = TRAP_NONE;
+
+        // Check for out-of-bounds writes
+        if (wr_en) begin
+            case (wr_op)
+                MEM_STORE_I32, MEM_STORE_I32_FROM_I64: begin
+                    if (!in_bounds(wr_addr, 4)) trap = TRAP_OUT_OF_BOUNDS;
+                end
+                MEM_STORE_I64: begin
+                    if (!in_bounds(wr_addr, 8)) trap = TRAP_OUT_OF_BOUNDS;
+                end
+                MEM_STORE_I8: begin
+                    if (!in_bounds(wr_addr, 1)) trap = TRAP_OUT_OF_BOUNDS;
+                end
+                MEM_STORE_I16: begin
+                    if (!in_bounds(wr_addr, 2)) trap = TRAP_OUT_OF_BOUNDS;
+                end
+                default: ;
+            endcase
+        end
 
         if (rd_en) begin
             case (rd_op)
@@ -173,6 +195,7 @@ module wasm_memory
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             num_pages <= 32'd0;  // Start with 0, will be set by init_en
+            max_pages <= MAX_PAGES;  // Default to parameter value
             grow_result <= 32'h0;
             wr_valid <= 1'b0;
             // Initialize memory to zero
@@ -183,6 +206,8 @@ module wasm_memory
             // Handle memory initialization
             if (init_en) begin
                 num_pages <= init_pages;
+                // Set max_pages: use init_max_pages if specified, otherwise MAX_PAGES
+                max_pages <= (init_max_pages != 0) ? init_max_pages : MAX_PAGES;
             end
 
             // Handle direct data segment write (for initialization)
@@ -195,7 +220,8 @@ module wasm_memory
 
             // Memory grow operation
             if (grow_en) begin
-                if (num_pages + grow_pages <= MAX_PAGES) begin
+                // Check against both runtime max_pages and compile-time MAX_PAGES
+                if (num_pages + grow_pages <= max_pages && num_pages + grow_pages <= MAX_PAGES) begin
                     grow_result <= num_pages;
                     num_pages <= num_pages + grow_pages;
                 end else begin

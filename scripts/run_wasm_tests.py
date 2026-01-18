@@ -3,9 +3,8 @@
 Run official WebAssembly test suite using the reference interpreter.
 Parses .wast files, extracts modules and assertions, and runs tests.
 
-Supports two modes:
-1. Inline mode: Creates individual test modules per assertion (for simple tests)
-2. Full-module mode: Runs multiple assertions against a single module (for stateful tests)
+Runs assertions in sequence against compiled modules, preserving state
+between assertions (memory, globals, etc.) as required by the spec.
 """
 
 import os
@@ -140,7 +139,7 @@ def extract_export_map(module: str) -> Dict[str, int]:
     export_map = {}
     func_idx = 0
 
-    # Find all function definitions
+    # Find all function definitions (but not (func inside (type ...))
     pos = 0
     while pos < len(module):
         # Look for function definitions
@@ -149,6 +148,18 @@ def extract_export_map(module: str) -> Dict[str, int]:
             break
 
         start = pos + func_match.start()
+
+        # Check if this (func is inside a (type ...) definition
+        # by counting open parens before this position
+        # A top-level func should have exactly 1 open paren (the module's)
+        prefix = module[:start]
+        paren_depth = prefix.count('(') - prefix.count(')')
+
+        # Skip if nested too deep (inside a type definition)
+        if paren_depth > 1:
+            pos = start + 1
+            continue
+
         end = find_matching_paren(module, start)
         if end == -1:
             break
@@ -263,75 +274,86 @@ def parse_assertion(expr: str, export_map: Dict[str, int], is_trap: bool = False
     )
 
 
+def encode_value(vtype: str, val) -> Tuple[int, int]:
+    """Encode a value to (type_code, hex_value) for the test list.
+    type_code: 0=i32, 1=i64, 2=f32, 3=f64
+    Returns the raw bit representation."""
+    import struct
+    import math
+
+    type_codes = {'i32': 0, 'i64': 1, 'f32': 2, 'f64': 3}
+    type_code = type_codes.get(vtype, 0)
+
+    if vtype in ('i32', 'i64'):
+        mask = 0xFFFFFFFF if vtype == 'i32' else 0xFFFFFFFFFFFFFFFF
+        if isinstance(val, int):
+            return type_code, val & mask
+        return type_code, 0
+    elif vtype == 'f32':
+        if isinstance(val, tuple):
+            nan_type = val[0]
+            is_negative = val[1]
+            sign_bit = 0x80000000 if is_negative else 0
+            if nan_type == 'nan_payload':
+                payload = val[2]
+                return type_code, sign_bit | 0x7F800000 | (payload & 0x7FFFFF)
+            return type_code, sign_bit | 0x7FC00000
+        elif isinstance(val, float) and math.isnan(val):
+            return type_code, 0x7FC00000
+        else:
+            return type_code, struct.unpack('<I', struct.pack('<f', val))[0]
+    elif vtype == 'f64':
+        if isinstance(val, tuple):
+            nan_type = val[0]
+            is_negative = val[1]
+            sign_bit = 0x8000000000000000 if is_negative else 0
+            if nan_type == 'nan_payload':
+                payload = val[2]
+                return type_code, sign_bit | 0x7FF0000000000000 | (payload & 0xFFFFFFFFFFFFF)
+            return type_code, sign_bit | 0x7FF8000000000000
+        elif isinstance(val, float) and math.isnan(val):
+            return type_code, 0x7FF8000000000000
+        else:
+            return type_code, struct.unpack('<Q', struct.pack('<d', val))[0]
+    return 0, 0
+
+
 def run_module_tests(group: ModuleTestGroup, wasm_path: Path, verbose: bool = False) -> Tuple[int, int, int]:
     """Run all assertions for a module using the multi-test runner."""
     passed = 0
     failed = 0
     skipped = 0
 
-    # Filter to assertions without arguments (current runner limitation)
-    simple_assertions = [a for a in group.assertions if not a.args]
-
-    if not simple_assertions:
-        return 0, 0, len(group.assertions)
+    if not group.assertions:
+        return 0, 0, 0
 
     # Generate test list file
-    # Format: <func_idx> <expected_hex> <test_mode> <is_i64>
+    # Format: <func_idx> <expected_hex> <test_mode> <is_i64> <num_args> [<arg_type> <arg_hex>]...
     # test_mode: 0=verify result, 1=expect trap, 2=run only (void function)
+    # arg_type: 0=i32, 1=i64, 2=f32, 3=f64
     testlist_path = wasm_path.with_suffix('.tests')
     with open(testlist_path, 'w') as f:
-        for assertion in simple_assertions:
+        for assertion in group.assertions:
+            # Encode arguments
+            args_str = ""
+            for arg_type, arg_val in assertion.args:
+                type_code, encoded_val = encode_value(arg_type, arg_val)
+                args_str += f" {type_code} {encoded_val:x}"
+
+            num_args = len(assertion.args)
+
             if assertion.expected is None and not assertion.is_trap:
                 # Void function - run for side effects but don't verify result
-                f.write(f"{assertion.func_idx} 0 2 0\n")
+                f.write(f"{assertion.func_idx} 0 2 0 {num_args}{args_str}\n")
                 continue
 
             if assertion.is_trap:
-                f.write(f"{assertion.func_idx} 0 1 0\n")
+                f.write(f"{assertion.func_idx} 0 1 0 {num_args}{args_str}\n")
             else:
                 exp_type, exp_val = assertion.expected
                 is_i64 = 1 if exp_type in ('i64', 'f64') else 0
-
-                if exp_type in ('i32', 'i64'):
-                    mask = 0xFFFFFFFF if exp_type == 'i32' else 0xFFFFFFFFFFFFFFFF
-                    expected = exp_val & mask
-                elif exp_type == 'f32':
-                    import struct
-                    import math
-                    if isinstance(exp_val, tuple):
-                        nan_type = exp_val[0]
-                        is_negative = exp_val[1]
-                        sign_bit = 0x80000000 if is_negative else 0
-                        if nan_type == 'nan_payload':
-                            payload = exp_val[2]
-                            expected = sign_bit | 0x7F800000 | (payload & 0x7FFFFF)
-                        else:
-                            expected = sign_bit | 0x7FC00000
-                    elif isinstance(exp_val, float) and math.isnan(exp_val):
-                        expected = 0x7FC00000
-                    else:
-                        expected = struct.unpack('<I', struct.pack('<f', exp_val))[0]
-                elif exp_type == 'f64':
-                    import struct
-                    import math
-                    if isinstance(exp_val, tuple):
-                        nan_type = exp_val[0]
-                        is_negative = exp_val[1]
-                        sign_bit = 0x8000000000000000 if is_negative else 0
-                        if nan_type == 'nan_payload':
-                            payload = exp_val[2]
-                            expected = sign_bit | 0x7FF0000000000000 | (payload & 0xFFFFFFFFFFFFF)
-                        else:
-                            expected = sign_bit | 0x7FF8000000000000
-                    elif isinstance(exp_val, float) and math.isnan(exp_val):
-                        expected = 0x7FF8000000000000
-                    else:
-                        expected = struct.unpack('<Q', struct.pack('<d', exp_val))[0]
-                else:
-                    skipped += 1
-                    continue
-
-                f.write(f"{assertion.func_idx} {expected:x} 0 {is_i64}\n")
+                _, expected = encode_value(exp_type, exp_val)
+                f.write(f"{assertion.func_idx} {expected:x} 0 {is_i64} {num_args}{args_str}\n")
 
     # Count valid tests in the testlist
     with open(testlist_path) as f:
@@ -839,7 +861,8 @@ def main():
     WASM_DIR.mkdir(parents=True, exist_ok=True)
 
     verbose = '-v' in sys.argv or '--verbose' in sys.argv
-    use_full_module = '--full-module' in sys.argv
+    # Full-module mode is now the default (and only mode)
+    use_full_module = True
 
     # Clean cached wasm files if requested
     if '--clean' in sys.argv:
@@ -879,9 +902,8 @@ def main():
     else:
         wast_files = [Path(arg) for arg in sys.argv[1:] if not arg.startswith('-')]
         if not wast_files:
-            print("Usage: run_wasm_tests.py [--all] [--clean] [--full-module] [file.wast ...] [-v]")
+            print("Usage: run_wasm_tests.py [--all] [--clean] [file.wast ...] [-v]")
             print("  --clean        Clear cached WASM files and regenerate")
-            print("  --full-module  Use full-module mode (runs assertions in sequence)")
             sys.exit(1)
 
     total_passed = 0

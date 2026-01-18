@@ -30,11 +30,22 @@ module wasm_runner;
     logic [7:0] dbg_instr_len;
     logic mem_init_en;
     logic [31:0] mem_init_pages;
+    logic [31:0] mem_init_max_pages;
     logic mem_data_wr_en;
     logic [31:0] mem_data_wr_addr;
     logic [7:0] mem_data_wr_data;
+    logic stack_init_en;
+    stack_entry_t stack_init_data;
+    logic stack_reset_en;
+    logic local_init_wr_en;
+    logic [15:0] local_init_wr_base;
+    logic [7:0] local_init_wr_idx;
+    stack_entry_t local_init_wr_data;
+    logic global_init_en;
+    logic [7:0] global_init_idx;
+    global_entry_t global_init_data;
 
-    wasm_cpu #(.CODE_SIZE(65536), .STACK_SIZE(1024), .MEM_PAGES(16)) dut (.*);
+    wasm_cpu #(.CODE_SIZE(65536), .STACK_SIZE(1024), .MEM_PAGES(1024)) dut (.*);
 
     always #5 clk = ~clk;
 
@@ -58,6 +69,12 @@ module wasm_runner;
     int test_mode_list [0:1023];
     int test_i64_list [0:1023];
     int num_tests;
+
+    // Argument storage for tests
+    // Max 32 arguments per test, 1024 tests
+    int test_num_args [0:1023];
+    int test_arg_types [0:1023][0:31];       // 0=i32, 1=i64, 2=f32, 3=f64
+    longint test_arg_values [0:1023][0:31];
 
     // Function information extracted from WASM
     typedef struct {
@@ -289,9 +306,12 @@ module wasm_runner;
         end
     endtask
 
-    // Extract initial memory size from WASM memory section
-    function automatic int extract_memory_size();
-        int pos, section_id, section_size, mem_count, flags, min_pages;
+    // Extract initial memory size and max from WASM memory section
+    task automatic extract_memory_info(output int min_pages, output int max_pages);
+        int pos, section_id, section_size, mem_count, flags;
+
+        min_pages = 1;  // Default
+        max_pages = 0;  // 0 = no limit
 
         pos = 8;
         while (pos < wasm_size) begin
@@ -305,15 +325,19 @@ module wasm_runner;
                     flags = wasm_data[pos];
                     pos++;
                     min_pages = read_leb128_u(pos);
-                    return min_pages;
+                    // If bit 0 of flags is set, max_pages follows
+                    if (flags & 1) begin
+                        max_pages = read_leb128_u(pos);
+                    end
+                    return;
                 end
-                return 0;
+                min_pages = 0;
+                return;
             end else begin
                 pos = pos + section_size;
             end
         end
-        return 1;  // Default
-    endfunction
+    endtask
 
     // Data segment storage
     logic [7:0] data_bytes [0:65535];
@@ -386,6 +410,90 @@ module wasm_runner;
         mem_data_wr_en = 0;
     endtask
 
+    // Global variables storage
+    global_entry_t global_entries [0:255];
+    int num_globals;
+
+    // Extract globals from WASM global section
+    task automatic extract_globals();
+        int pos, section_id, section_size, global_count;
+        int valtype, mutability;
+        longint init_val;
+        int opcode;
+
+        num_globals = 0;
+
+        pos = 8;
+        while (pos < wasm_size) begin
+            section_id = wasm_data[pos];
+            pos++;
+            section_size = read_leb128_u(pos);
+
+            if (section_id == 6) begin  // Global section
+                global_count = read_leb128_u(pos);
+
+                for (int g = 0; g < global_count && g < 256; g++) begin
+                    // Global type: valtype + mutability
+                    valtype = wasm_data[pos];
+                    pos++;
+                    mutability = wasm_data[pos];
+                    pos++;
+
+                    // Init expression: opcode + value + end
+                    opcode = wasm_data[pos];
+                    pos++;
+
+                    case (opcode)
+                        8'h41: begin  // i32.const
+                            init_val = read_leb128_s(pos);
+                            global_entries[num_globals].vtype = TYPE_I32;
+                        end
+                        8'h42: begin  // i64.const
+                            init_val = read_leb128_s(pos);
+                            global_entries[num_globals].vtype = TYPE_I64;
+                        end
+                        8'h43: begin  // f32.const
+                            init_val = {wasm_data[pos+3], wasm_data[pos+2], wasm_data[pos+1], wasm_data[pos]};
+                            pos = pos + 4;
+                            global_entries[num_globals].vtype = TYPE_F32;
+                        end
+                        8'h44: begin  // f64.const
+                            init_val = {wasm_data[pos+7], wasm_data[pos+6], wasm_data[pos+5], wasm_data[pos+4],
+                                        wasm_data[pos+3], wasm_data[pos+2], wasm_data[pos+1], wasm_data[pos]};
+                            pos = pos + 8;
+                            global_entries[num_globals].vtype = TYPE_F64;
+                        end
+                        default: begin
+                            init_val = 0;
+                            global_entries[num_globals].vtype = TYPE_I32;
+                        end
+                    endcase
+
+                    if (wasm_data[pos] == 8'h0B) pos++;  // end
+
+                    global_entries[num_globals].value = init_val;
+                    global_entries[num_globals].mutable_flag = (mutability == 1);
+                    num_globals++;
+                end
+                return;
+            end else begin
+                pos = pos + section_size;
+            end
+        end
+    endtask
+
+    // Load globals into global storage
+    task automatic load_globals();
+        for (int g = 0; g < num_globals; g++) begin
+            @(posedge clk);
+            global_init_en = 1;
+            global_init_idx = g[7:0];
+            global_init_data = global_entries[g];
+        end
+        @(posedge clk);
+        global_init_en = 0;
+    endtask
+
     // Load code for single-function mode (legacy compatibility)
     function automatic int extract_code(output logic [7:0] code[], output int code_len);
         int pos, section_id, section_size, func_count, body_size, local_count;
@@ -433,14 +541,16 @@ module wasm_runner;
     endfunction
 
     // Parse test list file
-    // Format: <func_idx> <expected_hex> <test_mode> <is_i64>
+    // Format: <func_idx> <expected_hex> <test_mode> <is_i64> <num_args> [<arg_type> <arg_hex>]...
     // test_mode: 0=verify result, 1=expect trap, 2=run only (void function)
+    // arg_type: 0=i32, 1=i64, 2=f32, 3=f64
     task automatic parse_testlist(input string filename);
         int fd;
-        string line;
         int func_id;
         longint expected;
-        int test_mode, is_64;
+        int test_mode, is_64, nargs;
+        int arg_type;
+        longint arg_val;
 
         num_tests = 0;
         fd = $fopen(filename, "r");
@@ -451,12 +561,22 @@ module wasm_runner;
 
         while (!$feof(fd)) begin
             int n;
-            n = $fscanf(fd, "%d %h %d %d\n", func_id, expected, test_mode, is_64);
-            if (n >= 2) begin
+            n = $fscanf(fd, "%d %h %d %d %d", func_id, expected, test_mode, is_64, nargs);
+            if (n >= 5) begin
                 test_func_list[num_tests] = func_id;
                 test_expected_list[num_tests] = expected;
-                test_mode_list[num_tests] = (n >= 3) ? test_mode : 0;
-                test_i64_list[num_tests] = (n >= 4) ? is_64 : 0;
+                test_mode_list[num_tests] = test_mode;
+                test_i64_list[num_tests] = is_64;
+                test_num_args[num_tests] = nargs;
+
+                // Read arguments
+                for (int a = 0; a < nargs && a < 32; a++) begin
+                    if ($fscanf(fd, " %d %h", arg_type, arg_val) == 2) begin
+                        test_arg_types[num_tests][a] = arg_type;
+                        test_arg_values[num_tests][a] = arg_val;
+                    end
+                end
+
                 num_tests++;
             end
         end
@@ -470,11 +590,52 @@ module wasm_runner;
         input longint expected,
         input int test_mode,
         input int is_64,
+        input int num_args,
+        input int arg_types [0:31],
+        input longint arg_values [0:31],
         output int passed
     );
         int cycles;
 
         passed = 0;
+
+        // Reset stacks before setting up arguments
+        @(posedge clk);
+        stack_reset_en = 1;
+        @(posedge clk);
+        stack_reset_en = 0;
+
+        // Clear locals 0-63 to zero (WebAssembly requires declared locals to be 0)
+        for (int i = 0; i < 64; i++) begin
+            @(posedge clk);
+            local_init_wr_en = 1;
+            local_init_wr_base = 16'h0;
+            local_init_wr_idx = i[7:0];
+            local_init_wr_data.vtype = TYPE_I32;
+            local_init_wr_data.value = 64'h0;
+        end
+        @(posedge clk);
+        local_init_wr_en = 0;
+
+        // Write arguments to locals (parameters are locals 0, 1, 2, ...)
+        // local_base will be set to 0 (stack_ptr after reset)
+        for (int a = 0; a < num_args; a++) begin
+            @(posedge clk);
+            local_init_wr_en = 1;
+            local_init_wr_base = 16'h0;  // Entry function uses local_base = 0
+            local_init_wr_idx = a[7:0];
+            // Map arg type: 0=i32, 1=i64, 2=f32, 3=f64
+            case (arg_types[a])
+                0: local_init_wr_data.vtype = TYPE_I32;
+                1: local_init_wr_data.vtype = TYPE_I64;
+                2: local_init_wr_data.vtype = TYPE_F32;
+                3: local_init_wr_data.vtype = TYPE_F64;
+                default: local_init_wr_data.vtype = TYPE_I32;
+            endcase
+            local_init_wr_data.value = arg_values[a];
+        end
+        @(posedge clk);
+        local_init_wr_en = 0;
 
         @(posedge clk);
         entry_func = func_id;
@@ -486,7 +647,7 @@ module wasm_runner;
         @(posedge clk);
 
         cycles = 0;
-        while (!halted && cycles < 100000) begin
+        while (!halted && cycles < 1000000) begin
             @(posedge clk);
             cycles++;
         end
@@ -519,6 +680,7 @@ module wasm_runner;
         int fd;
         int cycles;
         int init_mem_pages;
+        int init_mem_max_pages;
         int passed, total_passed, total_failed;
         int test_passed;
 
@@ -529,9 +691,20 @@ module wasm_runner;
         entry_func = 0;
         mem_init_en = 0;
         mem_init_pages = 0;
+        mem_init_max_pages = 0;
         mem_data_wr_en = 0;
         mem_data_wr_addr = 0;
         mem_data_wr_data = 0;
+        stack_init_en = 0;
+        stack_init_data = '0;
+        stack_reset_en = 0;
+        local_init_wr_en = 0;
+        local_init_wr_base = 0;
+        local_init_wr_idx = 0;
+        local_init_wr_data = '0;
+        global_init_en = 0;
+        global_init_idx = 0;
+        global_init_data = '0;
 
         // Get plusargs
         if (!$value$plusargs("wasm=%s", wasm_file)) begin
@@ -573,8 +746,8 @@ module wasm_runner;
         $fclose(fd);
         wasm_size--;  // Remove EOF
 
-        // Extract memory size
-        init_mem_pages = extract_memory_size();
+        // Extract memory size and max
+        extract_memory_info(init_mem_pages, init_mem_max_pages);
 
         // Reset
         @(posedge clk);
@@ -582,18 +755,24 @@ module wasm_runner;
         rst_n = 1;
         @(posedge clk);
 
-        // Initialize memory size
+        // Initialize memory size and max
         @(posedge clk);
         mem_init_en = 1;
         mem_init_pages = init_mem_pages;
+        mem_init_max_pages = init_mem_max_pages;
         @(posedge clk);
         mem_init_en = 0;
         mem_init_pages = 0;
+        mem_init_max_pages = 0;
         @(posedge clk);
 
         // Extract and load data segments
         extract_data_segments();
         load_data_segments();
+
+        // Extract and load global variables
+        extract_globals();
+        load_globals();
 
         if (use_testlist) begin
             // Multi-test mode: extract all functions
@@ -618,11 +797,22 @@ module wasm_runner;
             total_failed = 0;
 
             for (int t = 0; t < num_tests; t++) begin
+                // Copy arguments for this test into local arrays
+                automatic int local_arg_types [0:31];
+                automatic longint local_arg_values [0:31];
+                for (int a = 0; a < 32; a++) begin
+                    local_arg_types[a] = test_arg_types[t][a];
+                    local_arg_values[a] = test_arg_values[t][a];
+                end
+
                 run_invocation(
                     test_func_list[t],
                     test_expected_list[t],
                     test_mode_list[t],
                     test_i64_list[t],
+                    test_num_args[t],
+                    local_arg_types,
+                    local_arg_values,
                     test_passed
                 );
 
@@ -691,7 +881,7 @@ module wasm_runner;
             start = 0;
 
             cycles = 0;
-            while (!halted && cycles < 100000) begin
+            while (!halted && cycles < 1000000) begin
                 @(posedge clk);
                 cycles++;
             end

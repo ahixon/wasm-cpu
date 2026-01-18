@@ -17,6 +17,10 @@ module wasm_call_stack
     input  logic        pop_en,
     output frame_entry_t pop_data,
 
+    // Set stack pointer (for reset)
+    input  logic        set_sp_en,
+    input  logic [7:0]  set_sp_value,
+
     // Current frame peek
     output frame_entry_t current_frame,
 
@@ -54,7 +58,10 @@ module wasm_call_stack
         if (!rst_n) begin
             sp <= '0;
         end else begin
-            if (push_en && pop_en) begin
+            if (set_sp_en) begin
+                sp <= set_sp_value;
+            end
+            else if (push_en && pop_en) begin
                 // Replace top
                 frame_mem[sp - 1] <= push_data;
             end

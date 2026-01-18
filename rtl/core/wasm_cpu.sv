@@ -31,11 +31,30 @@ module wasm_cpu
     // Memory initialization interface
     input  logic        mem_init_en,
     input  logic [31:0] mem_init_pages,
+    input  logic [31:0] mem_init_max_pages,  // 0 = no limit beyond MEM_PAGES
 
     // Memory data initialization interface (for data segments)
     input  logic        mem_data_wr_en,
     input  logic [31:0] mem_data_wr_addr,
     input  logic [7:0]  mem_data_wr_data,
+
+    // Stack initialization interface (for pushing function arguments before start)
+    input  logic        stack_init_en,
+    input  stack_entry_t stack_init_data,
+
+    // Stack reset interface (for clearing all stacks between invocations)
+    input  logic        stack_reset_en,
+
+    // Locals initialization interface (for setting function arguments before start)
+    input  logic        local_init_wr_en,
+    input  logic [15:0] local_init_wr_base,
+    input  logic [7:0]  local_init_wr_idx,
+    input  stack_entry_t local_init_wr_data,
+
+    // Global initialization interface
+    input  logic        global_init_en,
+    input  logic [7:0]  global_init_idx,
+    input  global_entry_t global_init_data,
 
     // Result output
     output logic        result_valid,
@@ -81,6 +100,14 @@ module wasm_cpu
     stack_entry_t branch_saved_value;         // Saved result value (for arity=1)
     logic        branch_pop_pending;          // Pop from br_if that hasn't taken effect yet
 
+    // Call state - for copying arguments to locals
+    logic [15:0] call_func_idx;       // Index of function being called
+    logic [7:0]  call_param_count;    // Number of parameters to copy
+    logic [7:0]  call_arg_idx;        // Current argument being written
+    logic [15:0] call_new_local_base; // Base address for new function's locals
+    logic [15:0] call_peek_offset;    // Peek offset for reading arguments during call
+    stack_entry_t call_saved_arg;     // Saved argument from previous peek
+
     // Code memory
     logic [7:0] code_mem [0:CODE_SIZE-1];
     logic [7:0] instr_bytes [0:15];
@@ -113,11 +140,29 @@ module wasm_cpu
     logic        stack_empty, stack_full;
     trap_t       stack_trap;
 
+    // Combined push for internal operations and external initialization
+    logic        stack_push_combined;
+    stack_entry_t stack_push_data_combined;
+
+    // Combined set_sp for internal operations and external reset
+    logic        stack_set_sp_combined;
+    logic [15:0] stack_set_sp_value_combined;
+
+    // Allow external stack init when idle, halted, or trapped
+    assign stack_push_combined = stack_push_en | (stack_init_en && (state == STATE_IDLE || state == STATE_HALT || state == STATE_TRAP));
+    assign stack_push_data_combined = (stack_init_en && (state == STATE_IDLE || state == STATE_HALT || state == STATE_TRAP))
+                                      ? stack_init_data : stack_push_data;
+
+    // Allow external stack reset when idle, halted, or trapped
+    assign stack_set_sp_combined = stack_set_sp_en | (stack_reset_en && (state == STATE_IDLE || state == STATE_HALT || state == STATE_TRAP));
+    assign stack_set_sp_value_combined = (stack_reset_en && (state == STATE_IDLE || state == STATE_HALT || state == STATE_TRAP))
+                                         ? 16'h0 : stack_set_sp_value;
+
     wasm_stack #(.DEPTH(STACK_SIZE)) operand_stack (
         .clk(clk),
         .rst_n(rst_n),
-        .push_en(stack_push_en),
-        .push_data(stack_push_data),
+        .push_en(stack_push_combined),
+        .push_data(stack_push_data_combined),
         .pop_en(stack_pop_en),
         .pop_data(stack_pop_data),
         .peek_offset(stack_peek_offset),
@@ -126,8 +171,8 @@ module wasm_cpu
         .peek_data2(stack_peek_data2),
         .multi_pop_en(stack_multi_pop_en),
         .multi_pop_count(stack_multi_pop_count),
-        .set_sp_en(stack_set_sp_en),
-        .set_sp_value(stack_set_sp_value),
+        .set_sp_en(stack_set_sp_combined),
+        .set_sp_value(stack_set_sp_value_combined),
         .stack_ptr(stack_ptr),
         .empty(stack_empty),
         .full(stack_full),
@@ -164,9 +209,22 @@ module wasm_cpu
     // Must be in always_comb so peek_data is valid when read in always_ff
     always_comb begin
         // Default offsets for most operations
-        stack_peek_offset = 16'd1;   // TOS-1
-        stack_peek_offset2 = 16'd2;  // TOS-2
+        if (state == STATE_CALL) begin
+            stack_peek_offset = call_peek_offset;  // Use call-specific offset
+            stack_peek_offset2 = 16'd0;
+        end else begin
+            stack_peek_offset = 16'd1;   // TOS-1
+            stack_peek_offset2 = 16'd2;  // TOS-2
+        end
     end
+
+    // Combined set_sp for label stack: internal operations and external reset
+    logic        label_set_sp_combined;
+    logic [7:0]  label_set_sp_value_combined;
+
+    assign label_set_sp_combined = label_set_sp_en | (stack_reset_en && (state == STATE_IDLE || state == STATE_HALT || state == STATE_TRAP));
+    assign label_set_sp_value_combined = (stack_reset_en && (state == STATE_IDLE || state == STATE_HALT || state == STATE_TRAP))
+                                         ? 8'h0 : label_set_sp_value;
 
     wasm_label_stack label_stack (
         .clk(clk),
@@ -178,8 +236,8 @@ module wasm_cpu
         .branch_depth(label_branch_depth_comb),  // Use combinational depth for lookup
         .branch_target(label_branch_target),
         .branch_pop_en(label_branch_pop_en),
-        .set_sp_en(label_set_sp_en),
-        .set_sp_value(label_set_sp_value),
+        .set_sp_en(label_set_sp_combined),
+        .set_sp_value(label_set_sp_value_combined),
         .stack_ptr(label_stack_ptr),
         .empty(label_empty),
         .full(label_full)
@@ -197,6 +255,13 @@ module wasm_cpu
     logic        frame_empty, frame_full;
     trap_t       frame_trap;
 
+    // Combined set_sp for frame stack: external reset
+    logic        frame_set_sp_combined;
+    logic [7:0]  frame_set_sp_value_combined;
+
+    assign frame_set_sp_combined = (stack_reset_en && (state == STATE_IDLE || state == STATE_HALT || state == STATE_TRAP));
+    assign frame_set_sp_value_combined = 8'h0;
+
     wasm_call_stack call_stack (
         .clk(clk),
         .rst_n(rst_n),
@@ -204,6 +269,8 @@ module wasm_cpu
         .push_data(frame_push_data),
         .pop_en(frame_pop_en),
         .pop_data(frame_pop_data),
+        .set_sp_en(frame_set_sp_combined),
+        .set_sp_value(frame_set_sp_value_combined),
         .current_frame(current_frame),
         .stack_ptr(frame_stack_ptr),
         .empty(frame_empty),
@@ -235,6 +302,7 @@ module wasm_cpu
         .rst_n(rst_n),
         .init_en(mem_init_en),
         .init_pages(mem_init_pages),
+        .init_max_pages(mem_init_max_pages),
         .data_wr_en(mem_data_wr_en),
         .data_wr_addr(mem_data_wr_addr),
         .data_wr_data(mem_data_wr_data),
@@ -272,6 +340,20 @@ module wasm_cpu
     valtype_t local_init_types [0:31];
     assign local_init_types = '{default: TYPE_I32};
 
+    // Combined write for internal operations and external initialization
+    logic        local_wr_combined;
+    logic [15:0] local_wr_base_combined;
+    logic [7:0]  local_wr_idx_combined;
+    stack_entry_t local_wr_data_combined;
+
+    assign local_wr_combined = local_wr_en | (local_init_wr_en && (state == STATE_IDLE || state == STATE_HALT || state == STATE_TRAP));
+    assign local_wr_base_combined = (local_init_wr_en && (state == STATE_IDLE || state == STATE_HALT || state == STATE_TRAP))
+                                    ? local_init_wr_base : local_wr_base_idx;
+    assign local_wr_idx_combined = (local_init_wr_en && (state == STATE_IDLE || state == STATE_HALT || state == STATE_TRAP))
+                                   ? local_init_wr_idx : local_wr_idx;
+    assign local_wr_data_combined = (local_init_wr_en && (state == STATE_IDLE || state == STATE_HALT || state == STATE_TRAP))
+                                    ? local_init_wr_data : local_wr_data;
+
     wasm_locals locals_inst (
         .clk(clk),
         .rst_n(rst_n),
@@ -280,10 +362,10 @@ module wasm_cpu
         .local_idx(local_idx),
         .rd_data(local_rd_data),
         .rd_valid(local_rd_valid),
-        .wr_en(local_wr_en),
-        .wr_base_idx(local_wr_base_idx),
-        .wr_local_idx(local_wr_idx),
-        .wr_data(local_wr_data),
+        .wr_en(local_wr_combined),
+        .wr_base_idx(local_wr_base_combined),
+        .wr_local_idx(local_wr_idx_combined),
+        .wr_data(local_wr_data_combined),
         .wr_valid(local_wr_valid),
         .init_en(1'b0),
         .init_base(16'h0),
@@ -317,9 +399,9 @@ module wasm_cpu
         .wr_data(global_wr_data),
         .wr_valid(global_wr_valid),
         .wr_error(global_wr_error),
-        .init_en(1'b0),
-        .init_idx(8'h0),
-        .init_data('0),
+        .init_en(global_init_en),
+        .init_idx(global_init_idx),
+        .init_data(global_init_data),
         .num_globals()
     );
 
@@ -564,11 +646,12 @@ module wasm_cpu
                         trapped <= 1'b0;
 
                         // Push initial frame for entry function
+                        // Use current stack_ptr as local_base - args are already on stack
                         frame_push_en <= 1'b1;
                         frame_push_data.return_pc <= 32'hFFFFFFFF;  // Special: no return
                         frame_push_data.func_idx <= entry_func[15:0];
-                        frame_push_data.local_base <= 16'h0;
-                        frame_push_data.stack_height <= 16'h0;
+                        frame_push_data.local_base <= stack_ptr;
+                        frame_push_data.stack_height <= stack_ptr;
                         frame_push_data.label_height <= 8'h0;
                         frame_push_data.arity <= func_table[entry_func].result_count;
                     end
@@ -662,18 +745,16 @@ module wasm_cpu
                         end
 
                         OP_END: begin
-                            if (!label_empty) begin
-                                label_pop_en <= 1'b1;
-                            end
-                            // Check if this is function end (after pop, sp will equal label_height)
+                            // Check if this is function end (no labels pushed by this function)
                             if (label_empty || label_stack_ptr == current_frame.label_height) begin
-                                // Function return
+                                // Function return - don't pop any labels (none belong to this function)
                                 if (current_frame.return_pc == 32'hFFFFFFFF) begin
                                     // Entry function return - halt
                                     if (!stack_empty) begin
                                         result_valid <= 1'b1;
                                         result_value <= stack_pop_data;
                                     end
+                                    frame_pop_en <= 1'b1;  // Pop entry frame
                                     halted <= 1'b1;
                                     state <= STATE_HALT;
                                 end else begin
@@ -682,6 +763,8 @@ module wasm_cpu
                                     state <= STATE_FETCH;
                                 end
                             end else begin
+                                // Block end - pop the label
+                                label_pop_en <= 1'b1;
                                 pc <= saved_next_pc;
                                 state <= STATE_FETCH;
                             end
@@ -805,6 +888,7 @@ module wasm_cpu
                                     result_valid <= 1'b1;
                                     result_value <= stack_pop_data;
                                 end
+                                frame_pop_en <= 1'b1;  // Pop entry frame
                                 halted <= 1'b1;
                                 state <= STATE_HALT;
                             end else begin
@@ -817,17 +901,19 @@ module wasm_cpu
                         end
 
                         OP_CALL: begin
-                            // Call function
-                            frame_push_en <= 1'b1;
-                            frame_push_data.return_pc <= saved_next_pc;
-                            frame_push_data.func_idx <= saved_decoded.immediate[15:0];
-                            frame_push_data.local_base <= stack_ptr;
-                            frame_push_data.stack_height <= stack_ptr;
-                            frame_push_data.label_height <= label_stack_ptr;
-                            frame_push_data.arity <= func_table[saved_decoded.immediate[15:0]].result_count;
-
-                            pc <= func_table[saved_decoded.immediate[15:0]].code_offset;
-                            state <= STATE_FETCH;
+                            // Call function - need to copy arguments from stack to locals
+                            call_func_idx <= saved_decoded.immediate[15:0];
+                            call_param_count <= func_table[saved_decoded.immediate[15:0]].param_count;
+                            call_arg_idx <= 8'd0;
+                            // Initialize peek offset to read the first argument (deepest on stack)
+                            // arg0 is at offset (param_count - 1) from TOS
+                            call_peek_offset <= {8'b0, func_table[saved_decoded.immediate[15:0]].param_count - 8'd1};
+                            // Allocate locals for the called function starting at current position
+                            // The arguments will be written starting at this base
+                            call_new_local_base <= current_frame.local_base +
+                                                   func_table[current_frame.func_idx].param_count +
+                                                   func_table[current_frame.func_idx].local_count;
+                            state <= STATE_CALL;
                         end
 
                         // ==== Parametric Instructions ====
@@ -1131,7 +1217,8 @@ module wasm_cpu
                         end
 
                         OP_I32_STORE: begin
-                            stack_pop_en <= 1'b1;
+                            stack_multi_pop_en <= 1'b1;
+                            stack_multi_pop_count <= 8'd2;
                             effective_addr_full = {1'b0, operand_b.value[31:0]} + {1'b0, saved_decoded.immediate2};
                             effective_addr_overflow = effective_addr_full[32];
                             effective_addr = effective_addr_full[31:0];
@@ -1143,13 +1230,13 @@ module wasm_cpu
                                 mem_wr_addr <= effective_addr;
                                 mem_wr_op <= MEM_STORE_I32;
                                 mem_wr_data <= operand_a.value;
-                                pc <= saved_next_pc;
-                                state <= STATE_FETCH;
+                                state <= STATE_MEMORY;  // Check for trap
                             end
                         end
 
                         OP_I64_STORE: begin
-                            stack_pop_en <= 1'b1;
+                            stack_multi_pop_en <= 1'b1;
+                            stack_multi_pop_count <= 8'd2;
                             effective_addr_full = {1'b0, operand_b.value[31:0]} + {1'b0, saved_decoded.immediate2};
                             effective_addr_overflow = effective_addr_full[32];
                             effective_addr = effective_addr_full[31:0];
@@ -1161,13 +1248,13 @@ module wasm_cpu
                                 mem_wr_addr <= effective_addr;
                                 mem_wr_op <= MEM_STORE_I64;
                                 mem_wr_data <= operand_a.value;
-                                pc <= saved_next_pc;
-                                state <= STATE_FETCH;
+                                state <= STATE_MEMORY;  // Check for trap
                             end
                         end
 
                         OP_I32_STORE8: begin
-                            stack_pop_en <= 1'b1;
+                            stack_multi_pop_en <= 1'b1;
+                            stack_multi_pop_count <= 8'd2;
                             effective_addr_full = {1'b0, operand_b.value[31:0]} + {1'b0, saved_decoded.immediate2};
                             effective_addr_overflow = effective_addr_full[32];
                             effective_addr = effective_addr_full[31:0];
@@ -1179,13 +1266,13 @@ module wasm_cpu
                                 mem_wr_addr <= effective_addr;
                                 mem_wr_op <= MEM_STORE_I8;
                                 mem_wr_data <= {56'b0, operand_a.value[7:0]};
-                                pc <= saved_next_pc;
-                                state <= STATE_FETCH;
+                                state <= STATE_MEMORY;  // Check for trap
                             end
                         end
 
                         OP_I32_STORE16: begin
-                            stack_pop_en <= 1'b1;
+                            stack_multi_pop_en <= 1'b1;
+                            stack_multi_pop_count <= 8'd2;
                             effective_addr_full = {1'b0, operand_b.value[31:0]} + {1'b0, saved_decoded.immediate2};
                             effective_addr_overflow = effective_addr_full[32];
                             effective_addr = effective_addr_full[31:0];
@@ -1197,13 +1284,13 @@ module wasm_cpu
                                 mem_wr_addr <= effective_addr;
                                 mem_wr_op <= MEM_STORE_I16;
                                 mem_wr_data <= {48'b0, operand_a.value[15:0]};
-                                pc <= saved_next_pc;
-                                state <= STATE_FETCH;
+                                state <= STATE_MEMORY;  // Check for trap
                             end
                         end
 
                         OP_I64_STORE8: begin
-                            stack_pop_en <= 1'b1;
+                            stack_multi_pop_en <= 1'b1;
+                            stack_multi_pop_count <= 8'd2;
                             effective_addr_full = {1'b0, operand_b.value[31:0]} + {1'b0, saved_decoded.immediate2};
                             effective_addr_overflow = effective_addr_full[32];
                             effective_addr = effective_addr_full[31:0];
@@ -1215,13 +1302,13 @@ module wasm_cpu
                                 mem_wr_addr <= effective_addr;
                                 mem_wr_op <= MEM_STORE_I8;
                                 mem_wr_data <= {56'b0, operand_a.value[7:0]};
-                                pc <= saved_next_pc;
-                                state <= STATE_FETCH;
+                                state <= STATE_MEMORY;  // Check for trap
                             end
                         end
 
                         OP_I64_STORE16: begin
-                            stack_pop_en <= 1'b1;
+                            stack_multi_pop_en <= 1'b1;
+                            stack_multi_pop_count <= 8'd2;
                             effective_addr_full = {1'b0, operand_b.value[31:0]} + {1'b0, saved_decoded.immediate2};
                             effective_addr_overflow = effective_addr_full[32];
                             effective_addr = effective_addr_full[31:0];
@@ -1233,13 +1320,13 @@ module wasm_cpu
                                 mem_wr_addr <= effective_addr;
                                 mem_wr_op <= MEM_STORE_I16;
                                 mem_wr_data <= {48'b0, operand_a.value[15:0]};
-                                pc <= saved_next_pc;
-                                state <= STATE_FETCH;
+                                state <= STATE_MEMORY;  // Check for trap
                             end
                         end
 
                         OP_I64_STORE32: begin
-                            stack_pop_en <= 1'b1;
+                            stack_multi_pop_en <= 1'b1;
+                            stack_multi_pop_count <= 8'd2;
                             effective_addr_full = {1'b0, operand_b.value[31:0]} + {1'b0, saved_decoded.immediate2};
                             effective_addr_overflow = effective_addr_full[32];
                             effective_addr = effective_addr_full[31:0];
@@ -1251,8 +1338,43 @@ module wasm_cpu
                                 mem_wr_addr <= effective_addr;
                                 mem_wr_op <= MEM_STORE_I32_FROM_I64;
                                 mem_wr_data <= {32'b0, operand_a.value[31:0]};
-                                pc <= saved_next_pc;
-                                state <= STATE_FETCH;
+                                state <= STATE_MEMORY;  // Check for trap
+                            end
+                        end
+
+                        OP_F32_STORE: begin
+                            stack_multi_pop_en <= 1'b1;
+                            stack_multi_pop_count <= 8'd2;
+                            effective_addr_full = {1'b0, operand_b.value[31:0]} + {1'b0, saved_decoded.immediate2};
+                            effective_addr_overflow = effective_addr_full[32];
+                            effective_addr = effective_addr_full[31:0];
+                            if (effective_addr_overflow) begin
+                                trap_code <= TRAP_OUT_OF_BOUNDS;
+                                state <= STATE_TRAP;
+                            end else begin
+                                mem_wr_en <= 1'b1;
+                                mem_wr_addr <= effective_addr;
+                                mem_wr_op <= MEM_STORE_I32;  // f32 is 32-bit
+                                mem_wr_data <= {32'b0, operand_a.value[31:0]};
+                                state <= STATE_MEMORY;
+                            end
+                        end
+
+                        OP_F64_STORE: begin
+                            stack_multi_pop_en <= 1'b1;
+                            stack_multi_pop_count <= 8'd2;
+                            effective_addr_full = {1'b0, operand_b.value[31:0]} + {1'b0, saved_decoded.immediate2};
+                            effective_addr_overflow = effective_addr_full[32];
+                            effective_addr = effective_addr_full[31:0];
+                            if (effective_addr_overflow) begin
+                                trap_code <= TRAP_OUT_OF_BOUNDS;
+                                state <= STATE_TRAP;
+                            end else begin
+                                mem_wr_en <= 1'b1;
+                                mem_wr_addr <= effective_addr;
+                                mem_wr_op <= MEM_STORE_I64;  // f64 is 64-bit
+                                mem_wr_data <= operand_a.value;
+                                state <= STATE_MEMORY;
                             end
                         end
 
@@ -1675,6 +1797,11 @@ module wasm_cpu
                         pc <= saved_next_pc;
                         state <= STATE_FETCH;
                     end
+                    else if (mem_wr_valid) begin
+                        // Memory write completed successfully
+                        pc <= saved_next_pc;
+                        state <= STATE_FETCH;
+                    end
                     else if (mem_trap != TRAP_NONE) begin
                         trapped <= 1'b1;
                         trap_code <= mem_trap;
@@ -1807,6 +1934,64 @@ module wasm_cpu
                         stack_push_data.vtype <= exec_result_type;
                         stack_push_data.value <= exec_result;
                         pc <= saved_next_pc;
+                        state <= STATE_FETCH;
+                    end
+                end
+
+                STATE_CALL: begin
+                    // Copy arguments from operand stack to locals for called function
+                    // Pipeline: cycle N reads arg[N], cycle N+1 writes arg[N]
+                    // Arguments are on stack: [..., arg0, arg1, arg2] where arg2 is TOS (offset 0)
+                    // arg[i] is at peek_offset = param_count - 1 - i
+                    //
+                    // Cycle 0: peek arg0 (offset = param_count-1), set up for arg1
+                    // Cycle 1: save arg0, peek arg1, write nothing yet
+                    // Cycle 2: write arg0, save arg1, peek arg2...
+                    // etc.
+
+                    // Save current peeked value
+                    call_saved_arg <= stack_peek_data;
+
+                    if (call_arg_idx < call_param_count) begin
+                        // Write previously saved argument (except on first cycle)
+                        if (call_arg_idx > 0) begin
+                            local_wr_en <= 1'b1;
+                            local_wr_base_idx <= call_new_local_base;
+                            local_wr_idx <= call_arg_idx - 8'd1;
+                            local_wr_data <= call_saved_arg;
+                        end
+
+                        // Update peek offset for next argument
+                        if (call_arg_idx + 8'd1 < call_param_count) begin
+                            call_peek_offset <= {8'b0, call_param_count - 8'd2 - call_arg_idx};
+                        end
+                        call_arg_idx <= call_arg_idx + 8'd1;
+                    end else begin
+                        // Write the last saved argument (if any)
+                        if (call_param_count > 0) begin
+                            local_wr_en <= 1'b1;
+                            local_wr_base_idx <= call_new_local_base;
+                            local_wr_idx <= call_param_count - 8'd1;
+                            local_wr_data <= call_saved_arg;
+                        end
+
+                        // Pop arguments from stack
+                        if (call_param_count > 0) begin
+                            stack_multi_pop_en <= 1'b1;
+                            stack_multi_pop_count <= call_param_count;
+                        end
+
+                        // Push call frame
+                        frame_push_en <= 1'b1;
+                        frame_push_data.return_pc <= saved_next_pc;
+                        frame_push_data.func_idx <= call_func_idx;
+                        frame_push_data.local_base <= call_new_local_base;
+                        frame_push_data.stack_height <= stack_ptr - {8'b0, call_param_count};
+                        frame_push_data.label_height <= label_stack_ptr;
+                        frame_push_data.arity <= func_table[call_func_idx].result_count;
+
+                        // Jump to function
+                        pc <= func_table[call_func_idx].code_offset;
                         state <= STATE_FETCH;
                     end
                 end
@@ -2121,9 +2306,27 @@ module wasm_cpu
                 end
 
                 STATE_TRAP: begin
-                    // Stay in trap state
+                    // Stay in trap state, but allow restart
                     trapped <= 1'b1;
                     halted <= 1'b1;
+
+                    if (start) begin
+                        // Restart execution at entry function
+                        pc <= func_table[entry_func].code_offset;
+                        state <= STATE_FETCH;
+                        halted <= 1'b0;
+                        trapped <= 1'b0;
+
+                        // Push implicit call frame for the entry function
+                        // Use current stack_ptr as local_base - args are already on stack
+                        frame_push_en <= 1'b1;
+                        frame_push_data.return_pc <= 32'hFFFFFFFF;  // Special: no return
+                        frame_push_data.func_idx <= entry_func[15:0];
+                        frame_push_data.local_base <= stack_ptr;
+                        frame_push_data.stack_height <= stack_ptr;
+                        frame_push_data.label_height <= 8'h0;
+                        frame_push_data.arity <= func_table[entry_func].result_count;
+                    end
                 end
 
                 STATE_HALT: begin
@@ -2136,11 +2339,12 @@ module wasm_cpu
                         trapped <= 1'b0;
 
                         // Push implicit call frame for the entry function
+                        // Use current stack_ptr as local_base - args are already on stack
                         frame_push_en <= 1'b1;
                         frame_push_data.return_pc <= 32'hFFFFFFFF;  // Special: no return
                         frame_push_data.func_idx <= entry_func[15:0];
-                        frame_push_data.local_base <= 16'h0;
-                        frame_push_data.stack_height <= 16'h0;
+                        frame_push_data.local_base <= stack_ptr;
+                        frame_push_data.stack_height <= stack_ptr;
                         frame_push_data.label_height <= 8'h0;
                         frame_push_data.arity <= func_table[entry_func].result_count;
                     end
