@@ -25,7 +25,17 @@ jobs:
         run: |
           sudo apt-get install -y ocaml dune
 
+      - name: Cache reference interpreter
+        id: cache-interpreter
+        uses: actions/cache@v4
+        with:
+          path: |
+            vendor/spec/interpreter/_build
+            vendor/spec/interpreter/wasm
+          key: interpreter-${{ hashFiles('vendor/spec/interpreter/**') }}
+
       - name: Build WebAssembly reference interpreter
+        if: steps.cache-interpreter.outputs.cache-hit != 'true'
         run: make
         working-directory: vendor/spec/interpreter
 
