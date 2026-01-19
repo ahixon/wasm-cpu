@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 # Paths
 SCRIPT_DIR = Path(__file__).parent
 PROJECT_DIR = SCRIPT_DIR.parent
-WASM_INTERP = PROJECT_DIR / 'spec' / 'interpreter' / 'wasm'
+WASM_INTERP = PROJECT_DIR / 'vendor' / 'spec' / 'interpreter' / 'wasm'
 RUNNER_EXE = PROJECT_DIR / 'build' / 'Vwasm_runner'
 WASM_DIR = PROJECT_DIR / 'build' / 'wasm_tests'
 
@@ -866,7 +866,7 @@ def run_tests_inline_mode(wast_path: Path, content: str, verbose: bool) -> Tuple
 def main():
     if not WASM_INTERP.exists():
         print(f"Error: WebAssembly interpreter not found at {WASM_INTERP}")
-        print("Build it with: cd spec/interpreter && make")
+        print("Build it with: cd vendor/spec/interpreter && make")
         sys.exit(1)
 
     if not RUNNER_EXE.exists():
@@ -944,7 +944,7 @@ def main():
 
     # Determine which test files to run
     if '--all' in sys.argv:
-        spec_dir = PROJECT_DIR / 'spec' / 'test' / 'core'
+        spec_dir = PROJECT_DIR / 'vendor' / 'spec' / 'test' / 'core'
         # Glob all .wast files and filter out unsupported tests
         all_wast = sorted(spec_dir.glob('*.wast'))
         wast_files = [f for f in all_wast if not should_skip_test(f.name)]
