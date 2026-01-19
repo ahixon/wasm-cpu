@@ -135,7 +135,13 @@ module wasm_cpu_tb;
         .mem_mgmt_req_o(mem_mgmt_req),
         .mem_mgmt_resp_i(mem_mgmt_resp),
         .mem_op_o(mem_op),
-        .mem_trap_i(mem_trap)
+        .mem_trap_i(mem_trap),
+        // External halt/resume tied off for standalone operation
+        .ext_halt_i(1'b0),
+        .ext_resume_i(1'b0),
+        .ext_resume_pc_i(32'b0),
+        .ext_resume_val_i(32'b0),
+        .ext_halted_o()
     );
 
     // Linear Memory

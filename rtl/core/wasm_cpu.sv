@@ -85,11 +85,10 @@ module wasm_cpu
     output logic [7:0]  dbg_instr_len,
 
     // External halt/resume interface (for SoC integration)
-    // These have defaults so CPU works standalone without supervisor
-    input  logic        ext_halt_i     = 1'b0,    // External halt request
-    input  logic        ext_resume_i   = 1'b0,    // Resume from external halt
-    input  logic [31:0] ext_resume_pc_i = '0,     // PC to resume at (0 = continue from trap PC)
-    input  logic [31:0] ext_resume_val_i = '0,    // Value to push on stack on resume
+    input  logic        ext_halt_i,               // External halt request
+    input  logic        ext_resume_i,             // Resume from external halt
+    input  logic [31:0] ext_resume_pc_i,          // PC to resume at (0 = continue from trap PC)
+    input  logic [31:0] ext_resume_val_i,         // Value to push on stack on resume
     output logic        ext_halted_o,             // CPU is externally halted (waiting for resume)
 
     // Import trap information (valid when trap_code == TRAP_IMPORT)
