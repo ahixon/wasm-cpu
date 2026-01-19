@@ -60,7 +60,56 @@ module wasm_runner;
     logic [31:0] type_init_param_types;
     logic [31:0] type_init_result_types;
 
+    // External halt/resume interface (for SoC integration, unused in standalone tests)
+    logic ext_halt_i = 0;
+    logic ext_resume_i = 0;
+    logic [31:0] ext_resume_pc_i = 0;
+    logic [31:0] ext_resume_val_i = 0;
+    logic ext_halted_o;
+
+    // Import trap information
+    logic [15:0] import_id_o;
+    logic [31:0] import_arg0_o;
+    logic [31:0] import_arg1_o;
+    logic [31:0] import_arg2_o;
+    logic [31:0] import_arg3_o;
+
+    // Debug memory read interface
+    logic dbg_mem_rd_en = 0;
+    logic [31:0] dbg_mem_rd_addr = 0;
+    logic [31:0] dbg_mem_rd_data;
+
+    // CPU -> Memory interface (struct-based, names must match CPU ports for .* connection)
+    mem_bus_req_t  mem_req_o;
+    mem_bus_resp_t mem_resp_i;
+    mem_mgmt_req_t mem_mgmt_req_o;
+    mem_mgmt_resp_t mem_mgmt_resp_i;
+    mem_op_t       mem_op_o;
+    trap_t         mem_trap_i;
+
     wasm_cpu #(.CODE_SIZE(65536), .STACK_SIZE(1024), .MEM_PAGES(1024)) dut (.*);
+
+    // Linear Memory
+    wasm_memory #(.MAX_PAGES(1024)) linear_memory (
+        .clk(clk),
+        .rst_n(rst_n),
+        // Memory bus interface (struct-based)
+        .mem_req_i(mem_req_o),
+        .mem_resp_o(mem_resp_i),
+        .mem_op_i(mem_op_o),
+        .mem_mgmt_req_i(mem_mgmt_req_o),
+        .mem_mgmt_resp_o(mem_mgmt_resp_i),
+        // Data segment initialization
+        .data_wr_en(mem_data_wr_en),
+        .data_wr_addr(mem_data_wr_addr),
+        .data_wr_data(mem_data_wr_data),
+        // Status
+        .trap(mem_trap_i),
+        // Debug interface
+        .dbg_rd_en(dbg_mem_rd_en),
+        .dbg_rd_addr(dbg_mem_rd_addr),
+        .dbg_rd_data(dbg_mem_rd_data)
+    );
 
     always #5 clk = ~clk;
 

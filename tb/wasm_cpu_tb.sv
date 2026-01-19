@@ -45,6 +45,25 @@ module wasm_cpu_tb;
     logic [7:0] global_init_idx = 0;
     global_entry_t global_init_data;
 
+    // Memory interface signals (directly to memory module)
+    logic mem_init_en = 0;
+    logic [31:0] mem_init_pages = 1;
+    logic [31:0] mem_init_max_pages = 16;
+    logic mem_data_wr_en = 0;
+    logic [31:0] mem_data_wr_addr = 0;
+    logic [7:0] mem_data_wr_data = 0;
+    logic dbg_mem_rd_en = 0;
+    logic [31:0] dbg_mem_rd_addr = 0;
+    logic [31:0] dbg_mem_rd_data;
+
+    // CPU -> Memory interface (struct-based)
+    mem_bus_req_t  mem_req;
+    mem_bus_resp_t mem_resp;
+    mem_mgmt_req_t mem_mgmt_req;
+    mem_mgmt_resp_t mem_mgmt_resp;
+    mem_op_t       mem_op;
+    trap_t         mem_trap;
+
     // Result
     logic result_valid;
     stack_entry_t result_value;
@@ -81,6 +100,12 @@ module wasm_cpu_tb;
         .func_wr_en(func_wr_en),
         .func_wr_idx(func_wr_idx),
         .func_wr_data(func_wr_data),
+        .mem_init_en(mem_init_en),
+        .mem_init_pages(mem_init_pages),
+        .mem_init_max_pages(mem_init_max_pages),
+        .mem_data_wr_en(mem_data_wr_en),
+        .mem_data_wr_addr(mem_data_wr_addr),
+        .mem_data_wr_data(mem_data_wr_data),
         .type_init_en(type_init_en),
         .type_init_idx(type_init_idx),
         .type_init_param_count(type_init_param_count),
@@ -100,7 +125,39 @@ module wasm_cpu_tb;
         .dbg_stack_ptr(dbg_stack_ptr),
         .dbg_saved_next_pc(dbg_saved_next_pc),
         .dbg_decode_next_pc(dbg_decode_next_pc),
-        .dbg_instr_len(dbg_instr_len)
+        .dbg_instr_len(dbg_instr_len),
+        .dbg_mem_rd_en(dbg_mem_rd_en),
+        .dbg_mem_rd_addr(dbg_mem_rd_addr),
+        .dbg_mem_rd_data(dbg_mem_rd_data),
+        // Memory bus interface (struct-based)
+        .mem_req_o(mem_req),
+        .mem_resp_i(mem_resp),
+        .mem_mgmt_req_o(mem_mgmt_req),
+        .mem_mgmt_resp_i(mem_mgmt_resp),
+        .mem_op_o(mem_op),
+        .mem_trap_i(mem_trap)
+    );
+
+    // Linear Memory
+    wasm_memory #(.MAX_PAGES(16)) linear_memory (
+        .clk(clk),
+        .rst_n(rst_n),
+        // Memory bus interface (struct-based)
+        .mem_req_i(mem_req),
+        .mem_resp_o(mem_resp),
+        .mem_op_i(mem_op),
+        .mem_mgmt_req_i(mem_mgmt_req),
+        .mem_mgmt_resp_o(mem_mgmt_resp),
+        // Data segment initialization
+        .data_wr_en(mem_data_wr_en),
+        .data_wr_addr(mem_data_wr_addr),
+        .data_wr_data(mem_data_wr_data),
+        // Status
+        .trap(mem_trap),
+        // Debug interface
+        .dbg_rd_en(dbg_mem_rd_en),
+        .dbg_rd_addr(dbg_mem_rd_addr),
+        .dbg_rd_data(dbg_mem_rd_data)
     );
 
     // Clock generation
