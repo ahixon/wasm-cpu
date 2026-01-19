@@ -26,11 +26,11 @@ jobs:
         uses: actions/cache@v4
         with:
           path: verilator
-          key: verilator-v5.024-${{ runner.os }}
+          key: verilator-v5.038-${{ runner.os }}
 
       - name: Clone Verilator
         if: steps.cache-verilator.outputs.cache-hit != 'true'
-        run: git clone https://github.com/verilator/verilator.git --depth 1 --branch v5.024
+        run: git clone https://github.com/verilator/verilator.git --depth 1 --branch v5.038
 
       - name: Build Verilator
         if: steps.cache-verilator.outputs.cache-hit != 'true'
