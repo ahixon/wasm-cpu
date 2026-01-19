@@ -60,7 +60,7 @@ module wasm_locals
             free_base <= 16'h0;
             wr_valid <= 1'b0;
             for (int i = 0; i < MAX_LOCALS; i++) begin
-                locals[i] <= '0;
+                locals[i] = '0;
             end
         end else begin
             wr_valid <= 1'b0;

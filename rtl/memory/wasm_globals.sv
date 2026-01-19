@@ -56,7 +56,7 @@ module wasm_globals
             wr_valid <= 1'b0;
             wr_error <= 1'b0;
             for (int i = 0; i < NUM_GLOBALS; i++) begin
-                globals[i] <= '0;
+                globals[i] = '0;
             end
         end else begin
             wr_valid <= 1'b0;

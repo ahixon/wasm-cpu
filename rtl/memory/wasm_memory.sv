@@ -256,7 +256,7 @@ module wasm_memory
             grow_done_q <= 1'b0;
             // Initialize memory to zero
             for (int i = 0; i < MAX_PAGES * PAGE_SIZE; i++) begin
-                mem[i] <= 8'h0;
+                mem[i] = 8'h0;
             end
         end else begin
             // Clear grow_done after one cycle

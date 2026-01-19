@@ -659,14 +659,14 @@ module wasm_cpu
         if (!rst_n) begin
             // Initialize all table sizes to 0
             for (int t = 0; t < 4; t++) begin
-                elem_table_size[t] <= 16'h0;
+                elem_table_size[t] = 16'h0;
             end
             // Initialize all entries to 0xFFFF (uninitialized marker)
             for (int i = 0; i < 256; i++) begin
-                elem_table_0[i] <= 16'hFFFF;
-                elem_table_1[i] <= 16'hFFFF;
-                elem_table_2[i] <= 16'hFFFF;
-                elem_table_3[i] <= 16'hFFFF;
+                elem_table_0[i] = 16'hFFFF;
+                elem_table_1[i] = 16'hFFFF;
+                elem_table_2[i] = 16'hFFFF;
+                elem_table_3[i] = 16'hFFFF;
             end
         end else if (elem_init_en) begin
             // Write to the appropriate table based on table index
@@ -690,8 +690,8 @@ module wasm_cpu
         if (!rst_n) begin
             // Initialize all entries to single-value types by default
             for (int i = 0; i < 256; i++) begin
-                type_table[i].param_count <= 8'h0;
-                type_table[i].result_count <= 8'h1;  // Default to 1 result
+                type_table[i].param_count = 8'h0;
+                type_table[i].result_count = 8'h1;  // Default to 1 result
             end
         end else if (type_init_en) begin
             type_table[type_init_idx].param_count <= type_init_param_count;
