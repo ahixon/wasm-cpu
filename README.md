@@ -1,11 +1,13 @@
 # wasm-cpu
 
-A hardware WebAssembly processor implemented in SystemVerilog.
+A hardware WebAssembly processor implemented in SystemVerilog. Currently supports WebAssembly v1. v2 and v3 support are in progress.
+
+[Discord](https://discord.com/channels/1463596115394822196/1463596116565037232)
 
 ## Building
 
 Requirements:
-- Verilator
+- Verilator (at least v5.038)
 - Python 3
 - OCaml and dune (for the reference interpreter)
 
