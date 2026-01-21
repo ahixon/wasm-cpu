@@ -175,6 +175,48 @@ module wasm_cpu
     logic [7:0] instr_bytes [0:15];
     logic [3:0] bytes_available;
 
+    // Function to compute LEB128 byte length by checking continuation bits
+    // Returns the number of bytes in a LEB128 sequence starting at addr
+    function automatic logic [3:0] leb128_len(input logic [31:0] addr);
+        logic [3:0] len;
+        len = 4'd1;
+        // Check continuation bits (high bit set means more bytes follow)
+        if (code_mem[addr][7]) begin
+            len = 4'd2;
+            if (code_mem[addr + 1][7]) begin
+                len = 4'd3;
+                if (code_mem[addr + 2][7]) begin
+                    len = 4'd4;
+                    if (code_mem[addr + 3][7]) begin
+                        len = 4'd5;  // Max for i32
+                    end
+                end
+            end
+        end
+        return len;
+    endfunction
+
+    // Function to compute blocktype length
+    // Blocktype is: 0x40 (empty), 0x7F-0x7C (valtype), or s33 LEB128 (type index)
+    function automatic logic [3:0] blocktype_len(input logic [31:0] addr);
+        logic [7:0] bt;
+        bt = code_mem[addr];
+        // Single-byte blocktypes: 0x40 (empty) or 0x7F-0x7C (value types)
+        if (bt == 8'h40 || (bt >= 8'h7C && bt <= 8'h7F))
+            return 4'd1;
+        else
+            // s33 type index - use LEB128 length
+            return leb128_len(addr);
+    endfunction
+
+    // Function to compute memory operation immediate length (memarg)
+    // Memory ops have: align (u32 LEB128) + offset (u32 LEB128)
+    function automatic logic [3:0] memarg_len(input logic [31:0] addr);
+        logic [3:0] align_len;
+        align_len = leb128_len(addr);
+        return align_len + leb128_len(addr + {28'b0, align_len});
+    endfunction
+
     // Decoded instruction
     logic        decode_valid;
     decoded_instr_t decoded;
@@ -2286,7 +2328,7 @@ module wasm_cpu
                     case (scan_byte)
                         8'h02, 8'h03, 8'h04: begin  // block, loop, if - increment depth
                             scan_depth <= scan_depth + 1;
-                            skip_len = 2;  // opcode + blocktype
+                            skip_len = {28'b0, 4'd1 + blocktype_len(pc + 1)};  // opcode + blocktype (variable length)
                         end
                         8'h05: begin  // else
                             if (scan_depth == 0) begin
@@ -2320,17 +2362,22 @@ module wasm_cpu
                             skip_len = 0;
                         end
                         // Instructions with LEB128 immediate
-                        8'h0C, 8'h0D: skip_len = 2;  // br, br_if (assume small label)
-                        8'h10: skip_len = 2;  // call (assume small index)
-                        8'h20, 8'h21, 8'h22, 8'h23, 8'h24: skip_len = 2;  // local/global ops
-                        8'h41: skip_len = 2;  // i32.const (assume small value)
-                        8'h42: skip_len = 2;  // i64.const (assume small value)
+                        8'h0C, 8'h0D: skip_len = {28'b0, 4'd1 + leb128_len(pc + 1)};  // br, br_if
+                        8'h10: skip_len = {28'b0, 4'd1 + leb128_len(pc + 1)};  // call
+                        8'h11: begin  // call_indirect - type index + table index (two LEB128s)
+                            logic [3:0] type_len;
+                            type_len = leb128_len(pc + 1);
+                            skip_len = {28'b0, 4'd1 + type_len + leb128_len(pc + 1 + {28'b0, type_len})};
+                        end
+                        8'h20, 8'h21, 8'h22, 8'h23, 8'h24: skip_len = {28'b0, 4'd1 + leb128_len(pc + 1)};  // local/global ops
+                        8'h41: skip_len = {28'b0, 4'd1 + leb128_len(pc + 1)};  // i32.const
+                        8'h42: skip_len = {28'b0, 4'd1 + leb128_len(pc + 1)};  // i64.const
                         8'h43: skip_len = 5;  // f32.const
                         8'h44: skip_len = 9;  // f64.const
                         8'h28, 8'h29, 8'h2A, 8'h2B, 8'h2C, 8'h2D, 8'h2E, 8'h2F,
                         8'h30, 8'h31, 8'h32, 8'h33, 8'h34, 8'h35, 8'h36, 8'h37,
-                        8'h38, 8'h39, 8'h3A, 8'h3B, 8'h3C, 8'h3D, 8'h3E: skip_len = 3;  // memory ops (align + offset)
-                        8'h3F, 8'h40: skip_len = 2;  // memory.size, memory.grow (single memidx)
+                        8'h38, 8'h39, 8'h3A, 8'h3B, 8'h3C, 8'h3D, 8'h3E: skip_len = {28'b0, 4'd1 + memarg_len(pc + 1)};  // memory ops (align + offset as LEB128s)
+                        8'h3F, 8'h40: skip_len = {28'b0, 4'd1 + leb128_len(pc + 1)};  // memory.size, memory.grow (memidx as LEB128)
                         default: skip_len = 1;  // Simple opcodes
                     endcase
 
@@ -2346,7 +2393,7 @@ module wasm_cpu
                     case (scan_byte)
                         8'h02, 8'h03, 8'h04: begin  // block, loop, if
                             scan_depth <= scan_depth + 1;
-                            skip_len = 2;
+                            skip_len = {28'b0, 4'd1 + blocktype_len(pc + 1)};  // opcode + blocktype (variable length)
                         end
                         8'h0B: begin  // end
                             if (scan_depth == 0) begin
@@ -2364,7 +2411,7 @@ module wasm_cpu
                             skip_len = 0;
                         end
                         8'h05: skip_len = 1;  // else (increment depth is implicit in if)
-                        8'h0C, 8'h0D: skip_len = 2;  // br, br_if
+                        8'h0C, 8'h0D: skip_len = {28'b0, 4'd1 + leb128_len(pc + 1)};  // br, br_if
                         8'h0E: begin  // br_table - variable length, need to scan
                             // Switch to br_table scan state
                             scan_br_table_start <= pc + 1;  // Start of count
@@ -2372,16 +2419,21 @@ module wasm_cpu
                             state <= STATE_SCAN_BR_TABLE;
                             skip_len = 0;
                         end
-                        8'h10: skip_len = 2;
-                        8'h20, 8'h21, 8'h22, 8'h23, 8'h24: skip_len = 2;
-                        8'h41: skip_len = 2;
-                        8'h42: skip_len = 2;
-                        8'h43: skip_len = 5;
-                        8'h44: skip_len = 9;
+                        8'h10: skip_len = {28'b0, 4'd1 + leb128_len(pc + 1)};  // call
+                        8'h11: begin  // call_indirect - type index + table index (two LEB128s)
+                            logic [3:0] type_len;
+                            type_len = leb128_len(pc + 1);
+                            skip_len = {28'b0, 4'd1 + type_len + leb128_len(pc + 1 + {28'b0, type_len})};
+                        end
+                        8'h20, 8'h21, 8'h22, 8'h23, 8'h24: skip_len = {28'b0, 4'd1 + leb128_len(pc + 1)};  // local/global ops
+                        8'h41: skip_len = {28'b0, 4'd1 + leb128_len(pc + 1)};  // i32.const
+                        8'h42: skip_len = {28'b0, 4'd1 + leb128_len(pc + 1)};  // i64.const
+                        8'h43: skip_len = 5;  // f32.const
+                        8'h44: skip_len = 9;  // f64.const
                         8'h28, 8'h29, 8'h2A, 8'h2B, 8'h2C, 8'h2D, 8'h2E, 8'h2F,
                         8'h30, 8'h31, 8'h32, 8'h33, 8'h34, 8'h35, 8'h36, 8'h37,
-                        8'h38, 8'h39, 8'h3A, 8'h3B, 8'h3C, 8'h3D, 8'h3E: skip_len = 3;
-                        8'h3F, 8'h40: skip_len = 2;  // memory.size, memory.grow (single memidx)
+                        8'h38, 8'h39, 8'h3A, 8'h3B, 8'h3C, 8'h3D, 8'h3E: skip_len = {28'b0, 4'd1 + memarg_len(pc + 1)};  // memory ops (align + offset as LEB128s)
+                        8'h3F, 8'h40: skip_len = {28'b0, 4'd1 + leb128_len(pc + 1)};  // memory.size, memory.grow (memidx as LEB128)
                         default: skip_len = 1;
                     endcase
 
@@ -2719,10 +2771,17 @@ module wasm_cpu
                             pc <= ext_resume_pc_i;
                         end
                         // If resume_val is provided, push it on stack (for return values)
-                        if (ext_resume_val_i != '0 || trap_code == TRAP_IMPORT) begin
+                        // Always push for TRAP_IMPORT and TRAP_MEMORY_GROW (they always return a value)
+                        if (ext_resume_val_i != '0 || trap_code == TRAP_IMPORT || trap_code == TRAP_MEMORY_GROW) begin
                             stack_push_en <= 1'b1;
                             stack_push_data.vtype <= TYPE_I32;
                             stack_push_data.value <= {32'b0, ext_resume_val_i};
+                        end
+                        // For MEMORY_GROW: if supervisor approved (result != -1), actually grow memory
+                        // import_arg0_q holds the requested pages from the original trap
+                        if (trap_code == TRAP_MEMORY_GROW && ext_resume_val_i != 32'hFFFFFFFF) begin
+                            mem_grow_en <= 1'b1;
+                            mem_grow_pages <= import_arg0_q;
                         end
                         state <= STATE_FETCH;
                         halted <= 1'b0;
