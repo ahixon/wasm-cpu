@@ -888,50 +888,23 @@ def main():
             WASM_DIR.mkdir(parents=True, exist_ok=True)
         print("Cleared cached WASM files")
 
-    # Tests to skip - these require features we don't support
+    # Tests to skip - features not yet implemented
     SKIP_TESTS = {
-        # SIMD tests - not implemented
-        'simd_',
-        # Reference types - not implemented
-        'ref_',
-        'table_',
-        'elem',
-        'local_init',  # Uses externref
-        'call_ref',    # Typed function references
-        'return_call_ref',
-        'br_on_null',
-        'br_on_non_null',
-        # Bulk memory - not implemented
-        'bulk',
-        # Exception handling - not implemented
-        'exception',
-        'throw',
-        'try',
-        # Multi-memory - not implemented
-        'multi-memory',
-        # Extended const - not implemented
-        'extended_const',
-        # Threads - not implemented
-        'atomic',
-        # Type tests that need complex setup
-        'type',
-        'imports',
-        'exports',
-        'linking',
-        # UTF-8 tests
-        'utf8',
-        'names',
-        # Token tests (syntax validation, not runtime)
-        'token',
-        'comments',
-        # Binary tests
-        'binary',
-        # Custom section tests
-        'custom',
-        # Data segment tests with complex initialization
-        'data',
-        # Start function tests
-        'start',
+        'simd',           # SIMD not implemented
+        'multi-memory',   # Multi-memory not implemented
+        'memory64',       # 64-bit memory not implemented
+        'gc',             # GC proposal not implemented
+        'exception',      # Exception handling not implemented
+        'bulk',           # Bulk memory operations not implemented
+        'ref_',           # Reference types (externref, funcref) not implemented
+        'table_',         # Table operations with reference types
+        'elem',           # Element segments with reference types
+        'call_ref',       # Typed function references not implemented
+        'return_call_ref',# Tail call with typed function references
+        'br_on_null',     # Reference type branch instructions
+        'br_on_non_null', # Reference type branch instructions
+        'local_init',     # Uses reference types
+        'type-',          # Type system tests (type-canon, type-rec, etc.)
     }
 
     def should_skip_test(name: str) -> bool:

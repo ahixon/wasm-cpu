@@ -38,11 +38,10 @@ Implemented:
 - Control flow (blocks, loops, branches, calls)
 - Local and global variables
 
-Not yet implemented:
-- SIMD
-- Reference types and tables
+Not yet implemented (skipped in tests):
+- SIMD (128-bit vector operations)
+- Reference types (externref, funcref, typed function references)
 - Bulk memory operations
 - Exception handling
-- Threads and atomics
-- Multiple memories
-- Module linking and imports
+- Multiple memories (multi-memory proposal)
+- GC proposal
