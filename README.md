@@ -2,7 +2,7 @@
 
 A hardware WebAssembly processor implemented in SystemVerilog. Currently supports WebAssembly v1. v2 and v3 support are in progress.
 
-[Discord](https://discord.com/channels/1463596115394822196/1463596116565037232)
+[Discord](https://discord.gg/vJ52qVu3)
 
 ## Building
 
