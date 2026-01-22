@@ -281,6 +281,14 @@ module wasm_cpu
     logic [31:0] table_grow_delta;
     logic [31:0] table_grow_init_val;
 
+    // Fill operation state
+    logic [31:0] fill_current_addr;   // Current write address
+    logic [31:0] fill_count;          // Remaining elements/bytes to fill
+    logic [31:0] fill_value;          // Value to write (32-bit for tables, 8-bit for memory)
+    logic [1:0]  fill_table_idx;      // Table index (for cache invalidation)
+    logic        fill_is_table;       // 1=table (4-byte stride), 0=memory (1-byte stride)
+    logic        fill_wait_write;     // Waiting for memory write completion
+
     // =========================================================================
     // Operand Stack
     // =========================================================================
@@ -861,6 +869,13 @@ module wasm_cpu
             table_grow_table_idx <= 2'b0;
             table_grow_delta <= 32'h0;
             table_grow_init_val <= 32'h0;
+            // Fill operation state
+            fill_current_addr <= 32'h0;
+            fill_count <= 32'h0;
+            fill_value <= 32'h0;
+            fill_table_idx <= 2'b0;
+            fill_is_table <= 1'b0;
+            fill_wait_write <= 1'b0;
         end else begin
             // Default assignments
             stack_push_en <= 1'b0;
@@ -2431,12 +2446,73 @@ module wasm_cpu
 
                                 // 0x11: table.fill - immediate2 = table_idx
                                 // Stack: [dest, val, count] -> []
-                                // For now, trap (complex operation)
                                 FC_TABLE_FILL: begin
-                                    // TODO: Implement table.fill loop
-                                    trapped <= 1'b1;
-                                    trap_code <= TRAP_UNREACHABLE;
-                                    state <= STATE_TRAP;
+                                    logic [1:0] tf_tbl_idx;
+                                    logic [31:0] tf_dest;
+                                    logic [31:0] tf_val;
+                                    logic [31:0] tf_count;
+
+                                    tf_tbl_idx = saved_decoded.immediate2[1:0];
+                                    tf_dest = operand_c.value[31:0];   // TOS-2 = dest
+                                    tf_val = operand_b.value[31:0];    // TOS-1 = val
+                                    tf_count = operand_a.value[31:0];  // TOS = count
+
+                                    stack_multi_pop_en <= 1'b1;
+                                    stack_multi_pop_count <= 8'd3;
+
+                                    // Bounds check must happen before count==0 early return (per spec)
+                                    if ((tf_dest + tf_count) > {16'b0, table_metadata_size[tf_tbl_idx]} ||
+                                        (tf_dest + tf_count) < tf_dest) begin
+                                        trapped <= 1'b1;
+                                        trap_code <= TRAP_OUT_OF_BOUNDS;
+                                        state <= STATE_TRAP;
+                                    end else if (tf_count == 0) begin
+                                        pc <= saved_next_pc;
+                                        state <= STATE_FETCH;
+                                    end else begin
+                                        fill_current_addr <= table_base[tf_tbl_idx] + (tf_dest << 2);
+                                        fill_count <= tf_count;
+                                        fill_value <= tf_val;
+                                        fill_table_idx <= tf_tbl_idx;
+                                        fill_is_table <= 1'b1;
+                                        fill_wait_write <= 1'b0;
+                                        pc <= saved_next_pc;
+                                        state <= STATE_FILL;
+                                    end
+                                end
+
+                                // 0x0B: memory.fill - mem_idx (always 0 for now)
+                                // Stack: [dest, val, count] -> []
+                                FC_MEMORY_FILL: begin
+                                    logic [31:0] mf_dest;
+                                    logic [31:0] mf_val;
+                                    logic [31:0] mf_count;
+
+                                    mf_dest = operand_c.value[31:0];   // TOS-2 = dest
+                                    mf_val = operand_b.value[31:0];    // TOS-1 = val
+                                    mf_count = operand_a.value[31:0];  // TOS = count
+
+                                    stack_multi_pop_en <= 1'b1;
+                                    stack_multi_pop_count <= 8'd3;
+
+                                    // Bounds check must happen before count==0 early return (per spec)
+                                    if ((mf_dest + mf_count) > (mem_current_pages << 16) ||
+                                        (mf_dest + mf_count) < mf_dest) begin
+                                        trapped <= 1'b1;
+                                        trap_code <= TRAP_OUT_OF_BOUNDS;
+                                        state <= STATE_TRAP;
+                                    end else if (mf_count == 0) begin
+                                        pc <= saved_next_pc;
+                                        state <= STATE_FETCH;
+                                    end else begin
+                                        fill_current_addr <= mf_dest;
+                                        fill_count <= mf_count;
+                                        fill_value <= {24'b0, mf_val[7:0]};
+                                        fill_is_table <= 1'b0;
+                                        fill_wait_write <= 1'b0;
+                                        pc <= saved_next_pc;
+                                        state <= STATE_FILL;
+                                    end
                                 end
 
                                 // 0x0C: table.init, 0x0D: elem.drop, 0x0E: table.copy
@@ -3175,6 +3251,45 @@ module wasm_cpu
                     end
                 end
 
+                STATE_FILL: begin
+                    if (fill_wait_write) begin
+                        // Waiting for write completion
+                        if (mem_wr_valid) begin
+                            fill_wait_write <= 1'b0;
+
+                            // Advance address and decrement count
+                            fill_current_addr <= fill_current_addr + (fill_is_table ? 32'd4 : 32'd1);
+                            fill_count <= fill_count - 32'd1;
+
+                            // Invalidate table cache for this entry (table fills only)
+                            if (fill_is_table) begin
+                                automatic logic [15:0] elem_idx = (fill_current_addr - table_base[fill_table_idx]) >> 2;
+                                automatic logic [3:0] cache_idx = {fill_table_idx, elem_idx[1:0]};
+                                if (table_cache[cache_idx].valid &&
+                                    table_cache[cache_idx].table_idx == fill_table_idx &&
+                                    table_cache[cache_idx].elem_idx == elem_idx) begin
+                                    table_cache[cache_idx].valid <= 1'b0;
+                                end
+                            end
+                        end else if (mem_resp_i.error) begin
+                            trapped <= 1'b1;
+                            trap_code <= TRAP_OUT_OF_BOUNDS;
+                            state <= STATE_TRAP;
+                        end
+                    end else begin
+                        if (fill_count == 0) begin
+                            state <= STATE_FETCH;
+                        end else begin
+                            // Issue next write
+                            mem_wr_en <= 1'b1;
+                            mem_wr_addr <= fill_current_addr;
+                            mem_wr_op <= fill_is_table ? MEM_STORE_I32 : MEM_STORE_I8;
+                            mem_wr_data <= fill_is_table ? {32'b0, fill_value} : {56'b0, fill_value[7:0]};
+                            fill_wait_write <= 1'b1;
+                        end
+                    end
+                end
+
                 STATE_CAPTURE_RESULTS: begin
                     // Capture multi-value results from stack before halting
                     // Results are on stack: result[0] at bottom, result[N-1] at TOS
@@ -3284,8 +3399,22 @@ module wasm_cpu
                         if (trap_code == TRAP_TABLE_GROW && ext_resume_val_i != 32'hFFFFFFFF) begin
                             table_metadata_size[table_grow_table_idx] <=
                                 table_metadata_size[table_grow_table_idx] + table_grow_delta[15:0];
+
+                            // Setup fill loop for new entries
+                            if (table_grow_delta != 0) begin
+                                fill_current_addr <= table_base[table_grow_table_idx] + (ext_resume_val_i << 2);
+                                fill_count <= table_grow_delta;
+                                fill_value <= table_grow_init_val;
+                                fill_table_idx <= table_grow_table_idx;
+                                fill_is_table <= 1'b1;
+                                fill_wait_write <= 1'b0;
+                                state <= STATE_FILL;
+                            end else begin
+                                state <= STATE_FETCH;
+                            end
+                        end else begin
+                            state <= STATE_FETCH;
                         end
-                        state <= STATE_FETCH;
                         halted <= 1'b0;
                         trapped <= 1'b0;
                         trap_code <= TRAP_NONE;

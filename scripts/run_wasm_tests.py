@@ -393,8 +393,14 @@ def get_functions_with_unsupported_opcodes(wasm_path: Path) -> set:
                     body_end = pos + body_size
                     call_graph[func_idx] = set()
 
-                    # Scan this function's body
+                    # Skip locals declaration at start of function body
                     scan_pos = pos
+                    local_count, scan_pos = read_leb128(scan_pos)
+                    for _ in range(local_count):
+                        _, scan_pos = read_leb128(scan_pos)  # count
+                        scan_pos += 1  # type
+
+                    # Scan this function's code for opcodes
                     while scan_pos < body_end:
                         opcode = data[scan_pos]
                         scan_pos += 1
@@ -404,6 +410,54 @@ def get_functions_with_unsupported_opcodes(wasm_path: Path) -> set:
                         elif opcode == 0x10:  # call instruction
                             callee, scan_pos = read_leb128(scan_pos)
                             call_graph[func_idx].add(callee)
+                        # Skip immediates for common opcodes to avoid false positives
+                        elif opcode in (0x02, 0x03, 0x04):  # block, loop, if
+                            _, scan_pos = read_leb128(scan_pos)  # block type
+                        elif opcode in (0x0C, 0x0D):  # br, br_if
+                            _, scan_pos = read_leb128(scan_pos)  # label
+                        elif opcode == 0x0E:  # br_table
+                            vec_len, scan_pos = read_leb128(scan_pos)
+                            for _ in range(vec_len + 1):  # +1 for default
+                                _, scan_pos = read_leb128(scan_pos)
+                        elif opcode == 0x11:  # call_indirect
+                            _, scan_pos = read_leb128(scan_pos)  # type_idx
+                            _, scan_pos = read_leb128(scan_pos)  # table_idx
+                        elif opcode in (0x20, 0x21, 0x22, 0x23, 0x24):  # local/global ops
+                            _, scan_pos = read_leb128(scan_pos)  # index
+                        elif opcode in (0x25, 0x26):  # table.get, table.set
+                            _, scan_pos = read_leb128(scan_pos)  # table_idx
+                        elif 0x28 <= opcode <= 0x3E:  # memory load/store ops
+                            _, scan_pos = read_leb128(scan_pos)  # align
+                            _, scan_pos = read_leb128(scan_pos)  # offset
+                        elif opcode in (0x3F, 0x40):  # memory.size, memory.grow
+                            scan_pos += 1  # reserved byte
+                        elif opcode == 0x41:  # i32.const
+                            _, scan_pos = read_leb128(scan_pos)
+                        elif opcode == 0x42:  # i64.const
+                            _, scan_pos = read_leb128(scan_pos)
+                        elif opcode == 0x43:  # f32.const
+                            scan_pos += 4
+                        elif opcode == 0x44:  # f64.const
+                            scan_pos += 8
+                        elif opcode == 0xD0:  # ref.null
+                            _, scan_pos = read_leb128(scan_pos)  # heap type
+                        elif opcode == 0xD2:  # ref.func
+                            _, scan_pos = read_leb128(scan_pos)  # func_idx
+                        elif opcode == 0xFC:  # misc prefix
+                            sub_op, scan_pos = read_leb128(scan_pos)
+                            # memory.fill, memory.copy, etc have mem_idx immediates
+                            if sub_op in (0x0A, 0x0B):  # memory.copy, memory.fill
+                                scan_pos += 1  # mem_idx (or two for copy)
+                                if sub_op == 0x0A:
+                                    scan_pos += 1
+                            elif sub_op in (0x08, 0x09):  # memory.init, data.drop
+                                _, scan_pos = read_leb128(scan_pos)  # data_idx
+                                if sub_op == 0x08:
+                                    scan_pos += 1  # mem_idx
+                            elif sub_op in (0x0C, 0x0D, 0x0E, 0x0F, 0x10, 0x11):  # table ops
+                                _, scan_pos = read_leb128(scan_pos)  # elem/table idx
+                                if sub_op in (0x0C, 0x0E):  # table.init, table.copy
+                                    _, scan_pos = read_leb128(scan_pos)
 
                     pos = body_end
 
@@ -451,11 +505,10 @@ def run_module_tests(group: ModuleTestGroup, wasm_path: Path, verbose: bool = Fa
             if verbose:
                 print(f"SKIP: {wasm_path.name} func {assertion.func_idx} (uses call_ref, v3/GC feature)")
         elif 'table_grow' in str(wasm_path):
-            # Check if table.grow would exceed hardware limit or uses fill feature
+            # Check if table.grow would exceed hardware limit
             # Skip tests where:
             # 1. Grow amount > hardware limit
             # 2. Expected old_size + grow > limit
-            # 3. Test expects non-null values after grow (fill not implemented)
             skip_reason = None
             for arg_type, arg_val in assertion.args:
                 if arg_type == 'i32' and isinstance(arg_val, int) and arg_val > HARDWARE_TABLE_LIMIT:
@@ -470,13 +523,6 @@ def run_module_tests(group: ModuleTestGroup, wasm_path: Path, verbose: bool = Fa
                                 if exp_val + arg_val > HARDWARE_TABLE_LIMIT:
                                     skip_reason = f"table grow exceeds {HARDWARE_TABLE_LIMIT} entry hardware limit"
                                     break
-            # Check for tests that expect non-null externref values after grow
-            # (our table.grow doesn't fill new entries yet)
-            if not skip_reason and assertion.expected:
-                for exp_type, exp_val in assertion.expected:
-                    if exp_type == 'externref' and isinstance(exp_val, int) and exp_val != 0xFFFFFFFF:
-                        skip_reason = "table.grow fill not implemented"
-                        break
             if skip_reason:
                 skipped += 1
                 if verbose:
@@ -1041,8 +1087,12 @@ def main():
     SKIP_TESTS = {
         # WebAssembly 2.0 features (in scope, not yet implemented)
         'simd',           # SIMD not implemented (Phase 6)
-        'bulk',           # Bulk memory operations not implemented (Phase 5)
         'elem',           # Element segments - table.init, elem.drop (Phase 3)
+        'memory_copy',    # memory.copy not yet implemented
+        'memory_init',    # memory.init not yet implemented (requires data segments)
+        'table_copy',     # table.copy not yet implemented
+        'table_init',     # table.init not yet implemented (requires element segments)
+        'table-sub',      # Subtyping tests
         # WebAssembly 3.0 features (out of scope - defer to S-mode firmware)
         'multi-memory',   # v3 - defer to S-mode
         'memory64',       # v3 - defer to S-mode
@@ -1066,6 +1116,10 @@ def main():
         spec_dir = PROJECT_DIR / 'vendor' / 'spec' / 'test' / 'core'
         # Glob all .wast files and filter out unsupported tests
         all_wast = sorted(spec_dir.glob('*.wast'))
+        # Also include specific bulk-memory tests that we support
+        bulk_memory_dir = spec_dir / 'bulk-memory'
+        if bulk_memory_dir.exists():
+            all_wast.extend(sorted(bulk_memory_dir.glob('*_fill.wast')))
         wast_files = [f for f in all_wast if not should_skip_test(f.name)]
     else:
         wast_files = [Path(arg) for arg in sys.argv[1:] if not arg.startswith('-')]

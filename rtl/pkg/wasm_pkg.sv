@@ -530,6 +530,7 @@ package wasm_pkg;
         STATE_CAPTURE_RESULTS, // Capturing multi-value results before halt
         STATE_TABLE_GROW_WAIT, // Waiting for table.grow size update to propagate
         STATE_TABLE_CACHE_MISS, // Waiting for table entry fetch from memory
+        STATE_FILL,             // Fill loop for table.grow/table.fill/memory.fill
         STATE_TRAP,
         STATE_HALT,
         STATE_EXT_HALT       // Halted by external supervisor, waiting for resume
