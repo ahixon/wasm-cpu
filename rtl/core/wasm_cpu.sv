@@ -81,6 +81,14 @@ module wasm_cpu
     input  logic [3:0]  elem_seg_init_type,   // Element type (funcref/externref)
     input  logic        elem_seg_init_dropped, // 1 = segment is already dropped (active/declarative)
 
+    // Data segment metadata initialization interface (for memory.init/data.drop)
+    // Data segments are stored in linear memory; this interface sets up metadata
+    input  logic        data_seg_init_en,
+    input  logic [3:0]  data_seg_init_idx,    // Which segment (0-15)
+    input  logic [31:0] data_seg_init_base,   // Base address in linear memory (source)
+    input  logic [31:0] data_seg_init_size,   // Size in bytes
+    input  logic        data_seg_init_dropped, // 1 = segment is already dropped (active)
+
     // Type table initialization interface (for multi-value block types)
     input  logic        type_init_en,
     input  logic [7:0]  type_init_idx,
@@ -317,6 +325,25 @@ module wasm_cpu
     logic        init_wait_read;          // Waiting for memory read
     logic        init_wait_write;         // Waiting for memory write
     logic [31:0] init_read_data;          // Data read from element segment
+
+    // =========================================================================
+    // Data Segment Metadata (for memory.init/data.drop)
+    // =========================================================================
+    // Data segments store raw bytes that can be copied to linear memory
+    // via memory.init. Active segments are marked as dropped at instantiation.
+
+    logic [31:0] data_seg_base [0:15];    // Base address in memory per segment (source)
+    logic [31:0] data_seg_size [0:15];    // Size in bytes per segment
+    logic [15:0] data_seg_dropped;        // Bitfield: 1 = segment is dropped
+
+    // memory.copy/memory.init copy operation state
+    logic [31:0] copy_src_addr;           // Current source address
+    logic [31:0] copy_dst_addr;           // Current destination address
+    logic [31:0] copy_count;              // Remaining bytes to copy
+    logic        copy_wait_read;          // Waiting for memory read
+    logic        copy_wait_write;         // Waiting for memory write
+    logic [7:0]  copy_read_data;          // Data byte read from source
+    logic        copy_direction;          // 0=forward (src<dst), 1=backward (src>=dst)
 
     // =========================================================================
     // Operand Stack
@@ -843,6 +870,28 @@ module wasm_cpu
                 elem_seg_dropped[elem_seg_init_idx] <= 1'b1;
             else
                 elem_seg_dropped[elem_seg_init_idx] <= 1'b0;
+        end
+    end
+
+    // =========================================================================
+    // Data Segment Metadata Interface (for memory.init/data.drop)
+    // =========================================================================
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            // Initialize all data segments to empty/dropped
+            for (int d = 0; d < 16; d++) begin
+                data_seg_base[d] <= 32'h0;
+                data_seg_size[d] <= 32'h0;
+            end
+            data_seg_dropped <= 16'hFFFF;  // All segments start as "dropped"
+        end else if (data_seg_init_en) begin
+            data_seg_base[data_seg_init_idx] <= data_seg_init_base;
+            data_seg_size[data_seg_init_idx] <= data_seg_init_size;
+            // Set or clear the dropped bit based on segment type
+            if (data_seg_init_dropped)
+                data_seg_dropped[data_seg_init_idx] <= 1'b1;
+            else
+                data_seg_dropped[data_seg_init_idx] <= 1'b0;
         end
     end
 
@@ -2569,6 +2618,136 @@ module wasm_cpu
                                     end
                                 end
 
+                                // 0x08: memory.init - copy from data segment to linear memory
+                                // Stack: [dest, src, count] -> []
+                                // immediate2[15:0] = data_idx, immediate2[31:16] = mem_idx (always 0)
+                                FC_MEMORY_INIT: begin
+                                    logic [3:0]  mi_data_idx;
+                                    logic [31:0] mi_dest;     // destination offset in memory
+                                    logic [31:0] mi_src;      // source offset in data segment
+                                    logic [31:0] mi_count;    // number of bytes to copy
+                                    logic [31:0] mi_seg_size;
+                                    logic [31:0] mi_mem_size;
+
+                                    mi_data_idx = saved_decoded.immediate2[3:0];
+                                    mi_dest = operand_c.value[31:0];   // TOS-2 = dest
+                                    mi_src = operand_b.value[31:0];    // TOS-1 = src
+                                    mi_count = operand_a.value[31:0];  // TOS = count
+                                    mi_seg_size = data_seg_size[mi_data_idx];
+                                    mi_mem_size = mem_current_pages << 16;
+
+                                    stack_multi_pop_en <= 1'b1;
+                                    stack_multi_pop_count <= 8'd3;
+
+                                    // Check if segment is dropped
+                                    if (data_seg_dropped[mi_data_idx]) begin
+                                        trapped <= 1'b1;
+                                        trap_code <= TRAP_OUT_OF_BOUNDS;
+                                        state <= STATE_TRAP;
+                                    end
+                                    // Bounds check on source (data segment)
+                                    else if ((mi_src + mi_count) > mi_seg_size ||
+                                             (mi_src + mi_count) < mi_src) begin
+                                        trapped <= 1'b1;
+                                        trap_code <= TRAP_OUT_OF_BOUNDS;
+                                        state <= STATE_TRAP;
+                                    end
+                                    // Bounds check on destination (linear memory)
+                                    else if ((mi_dest + mi_count) > mi_mem_size ||
+                                             (mi_dest + mi_count) < mi_dest) begin
+                                        trapped <= 1'b1;
+                                        trap_code <= TRAP_OUT_OF_BOUNDS;
+                                        state <= STATE_TRAP;
+                                    end
+                                    // Zero count is a valid no-op
+                                    else if (mi_count == 0) begin
+                                        pc <= saved_next_pc;
+                                        state <= STATE_FETCH;
+                                    end
+                                    // Start copy loop (always forward for memory.init)
+                                    else begin
+                                        copy_src_addr <= data_seg_base[mi_data_idx] + mi_src;
+                                        copy_dst_addr <= mi_dest;
+                                        copy_count <= mi_count;
+                                        copy_wait_read <= 1'b0;
+                                        copy_wait_write <= 1'b0;
+                                        copy_direction <= 1'b0;  // Forward copy
+                                        pc <= saved_next_pc;
+                                        state <= STATE_MEMORY_COPY;
+                                    end
+                                end
+
+                                // 0x09: data.drop - mark data segment as dropped
+                                // Stack: [] -> []
+                                // immediate2 = data_idx
+                                FC_DATA_DROP: begin
+                                    logic [3:0] dd_data_idx;
+                                    dd_data_idx = saved_decoded.immediate2[3:0];
+
+                                    // Mark segment as dropped (idempotent - dropping twice is ok)
+                                    data_seg_dropped[dd_data_idx] <= 1'b1;
+                                    pc <= saved_next_pc;
+                                    state <= STATE_FETCH;
+                                end
+
+                                // 0x0A: memory.copy - copy within linear memory
+                                // Stack: [dest, src, count] -> []
+                                // Handles overlapping regions per spec (copies backward if src < dest)
+                                FC_MEMORY_COPY: begin
+                                    logic [31:0] mc_dest;
+                                    logic [31:0] mc_src;
+                                    logic [31:0] mc_count;
+                                    logic [31:0] mc_mem_size;
+
+                                    mc_dest = operand_c.value[31:0];   // TOS-2 = dest
+                                    mc_src = operand_b.value[31:0];    // TOS-1 = src
+                                    mc_count = operand_a.value[31:0];  // TOS = count
+                                    mc_mem_size = mem_current_pages << 16;
+
+                                    stack_multi_pop_en <= 1'b1;
+                                    stack_multi_pop_count <= 8'd3;
+
+                                    // Bounds check on source
+                                    if ((mc_src + mc_count) > mc_mem_size ||
+                                        (mc_src + mc_count) < mc_src) begin
+                                        trapped <= 1'b1;
+                                        trap_code <= TRAP_OUT_OF_BOUNDS;
+                                        state <= STATE_TRAP;
+                                    end
+                                    // Bounds check on destination
+                                    else if ((mc_dest + mc_count) > mc_mem_size ||
+                                             (mc_dest + mc_count) < mc_dest) begin
+                                        trapped <= 1'b1;
+                                        trap_code <= TRAP_OUT_OF_BOUNDS;
+                                        state <= STATE_TRAP;
+                                    end
+                                    // Zero count is a valid no-op
+                                    else if (mc_count == 0) begin
+                                        pc <= saved_next_pc;
+                                        state <= STATE_FETCH;
+                                    end
+                                    // Start copy loop
+                                    // Per spec: if dest <= src, copy forward; if dest > src, copy backward
+                                    else begin
+                                        if (mc_dest <= mc_src) begin
+                                            // Forward copy: start from beginning
+                                            copy_src_addr <= mc_src;
+                                            copy_dst_addr <= mc_dest;
+                                            copy_direction <= 1'b0;
+                                        end else begin
+                                            // Backward copy: start from end
+                                            copy_src_addr <= mc_src + mc_count - 32'd1;
+                                            copy_dst_addr <= mc_dest + mc_count - 32'd1;
+                                            copy_direction <= 1'b1;
+                                        end
+                                        copy_count <= mc_count;
+                                        copy_wait_read <= 1'b0;
+                                        copy_wait_write <= 1'b0;
+                                        pc <= saved_next_pc;
+                                        state <= STATE_MEMORY_COPY;
+                                    end
+                                end
+
                                 // 0x0C: table.init - copy from element segment to table
                                 // Stack: [dest, src, count] -> []
                                 // immediate2[15:0] = elem_idx, immediate2[31:16] = table_idx
@@ -3472,6 +3651,61 @@ module wasm_cpu
                             mem_rd_addr <= init_src_addr;
                             mem_rd_op <= MEM_LOAD_I32;
                             init_wait_read <= 1'b1;
+                        end
+                    end
+                end
+
+                STATE_MEMORY_COPY: begin
+                    // memory.copy/memory.init byte-level copy loop
+                    // State machine: issue read -> wait for read -> issue write -> wait for write -> loop/done
+                    // copy_direction: 0=forward (increment), 1=backward (decrement)
+
+                    if (copy_wait_write) begin
+                        // Waiting for write to complete
+                        if (mem_wr_valid) begin
+                            // Write completed, advance to next byte
+                            if (copy_direction == 1'b0) begin
+                                // Forward: increment addresses
+                                copy_src_addr <= copy_src_addr + 32'd1;
+                                copy_dst_addr <= copy_dst_addr + 32'd1;
+                            end else begin
+                                // Backward: decrement addresses
+                                copy_src_addr <= copy_src_addr - 32'd1;
+                                copy_dst_addr <= copy_dst_addr - 32'd1;
+                            end
+                            copy_count <= copy_count - 32'd1;
+                            copy_wait_write <= 1'b0;
+                        end else if (mem_resp_i.error) begin
+                            trapped <= 1'b1;
+                            trap_code <= TRAP_OUT_OF_BOUNDS;
+                            state <= STATE_TRAP;
+                        end
+                    end else if (copy_wait_read) begin
+                        // Waiting for read to complete
+                        if (mem_rd_valid) begin
+                            // Read completed, issue write
+                            copy_read_data <= mem_rd_data[7:0];
+                            mem_wr_en <= 1'b1;
+                            mem_wr_addr <= copy_dst_addr;
+                            mem_wr_op <= MEM_STORE_I8;
+                            mem_wr_data <= {56'b0, mem_rd_data[7:0]};
+                            copy_wait_read <= 1'b0;
+                            copy_wait_write <= 1'b1;
+                        end else if (mem_resp_i.error) begin
+                            trapped <= 1'b1;
+                            trap_code <= TRAP_OUT_OF_BOUNDS;
+                            state <= STATE_TRAP;
+                        end
+                    end else begin
+                        // Not waiting - check if done or issue next read
+                        if (copy_count == 0) begin
+                            state <= STATE_FETCH;
+                        end else begin
+                            // Issue read from source
+                            mem_rd_en <= 1'b1;
+                            mem_rd_addr <= copy_src_addr;
+                            mem_rd_op <= MEM_LOAD_I8_U;
+                            copy_wait_read <= 1'b1;
                         end
                     end
                 end

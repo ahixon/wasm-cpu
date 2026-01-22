@@ -45,11 +45,11 @@ Implemented:
 - Reference instructions (ref.null, ref.is_null, ref.func, ref.as_non_null)
 - Reference branching (br_on_null, br_on_non_null)
 - Element segment operations (table.init, elem.drop)
+- Bulk memory operations (memory.init, memory.copy, memory.fill)
 
 Not yet implemented (skipped in tests):
-- SIMD (128-bit vector operations)
-- Bulk memory operations (memory.init, memory.copy, memory.fill)
-- Typed function references (call_ref, return_call_ref)
-- Exception handling
-- Multiple memories (multi-memory proposal)
-- GC proposal
+- SIMD (128-bit vector operations) - v2
+- Typed function references (call_ref, return_call_ref) - v3
+- Exception handling - v3
+- Multiple memories (multi-memory proposal) - v3
+- GC proposal - v3

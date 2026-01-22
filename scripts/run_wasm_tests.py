@@ -1059,8 +1059,6 @@ def main():
     SKIP_TESTS = {
         # WebAssembly 2.0 features (in scope, not yet implemented)
         'simd',           # SIMD not implemented (Phase 6)
-        'memory_copy',    # memory.copy not yet implemented
-        'memory_init',    # memory.init not yet implemented (requires data segments)
         'table_copy',     # table.copy not yet implemented
         'table-sub',      # Subtyping tests
         # WebAssembly 3.0 features (out of scope - defer to S-mode firmware)
@@ -1090,6 +1088,8 @@ def main():
         bulk_memory_dir = spec_dir / 'bulk-memory'
         if bulk_memory_dir.exists():
             all_wast.extend(sorted(bulk_memory_dir.glob('*_fill.wast')))
+            all_wast.extend(sorted(bulk_memory_dir.glob('memory_copy.wast')))
+            all_wast.extend(sorted(bulk_memory_dir.glob('memory_init.wast')))
         wast_files = [f for f in all_wast if not should_skip_test(f.name)]
     else:
         wast_files = [Path(arg) for arg in sys.argv[1:] if not arg.startswith('-')]

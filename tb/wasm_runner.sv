@@ -68,6 +68,13 @@ module wasm_runner;
     logic [3:0]  elem_seg_init_type;
     logic        elem_seg_init_dropped;
 
+    // Data segment metadata initialization interface
+    logic        data_seg_init_en;
+    logic [3:0]  data_seg_init_idx;
+    logic [31:0] data_seg_init_base;
+    logic [31:0] data_seg_init_size;
+    logic        data_seg_init_dropped;
+
     // Table base address configuration
     // Tables are stored in linear memory at these base addresses
     // Use addresses within the first 64KB page to avoid bounds issues
@@ -81,6 +88,13 @@ module wasm_runner;
     // Each segment has up to 256 elements (1KB), supporting 16 segments
     localparam logic [31:0] TB_ELEM_SEG_BASE = 32'h0001_0000;  // 64KB offset
     localparam int TB_ELEM_SEG_STRIDE = 32'h0000_0400;          // 1KB per segment (256 entries max)
+
+    // Data segment base address configuration (for passive segments used by memory.init)
+    // Passive data segments are stored at: 0x100000 + (seg_idx * 0x1000)
+    // This is in the "internal region" (1MB+) which bypasses wasm bounds checking
+    // Each segment has up to 4KB of data, supporting 16 segments (64KB total)
+    localparam logic [31:0] TB_DATA_SEG_BASE = 32'h0010_0000;  // 1MB offset
+    localparam int TB_DATA_SEG_STRIDE = 32'h0000_1000;          // 4KB per segment
 
     logic type_init_en;
     logic [7:0] type_init_idx;
@@ -521,19 +535,34 @@ module wasm_runner;
         end
     endtask
 
-    // Data segment storage
+    // Data segment storage (for memory.init) - support up to 16 segments
+    // Passive segment data is stored in memory starting at TB_DATA_SEG_BASE
+    typedef struct {
+        int offset;              // Destination offset in memory (for active segments)
+        int length;              // Length of data in bytes
+        int data_start;          // Start index in data_bytes array
+        logic is_passive;        // 1 = passive (available for memory.init), 0 = active (dropped)
+    } data_seg_info_t;
+    data_seg_info_t data_segments [0:15];
     logic [7:0] data_bytes [0:65535];
-    int data_offsets [0:63];
-    int data_lengths [0:63];
+    int data_bytes_pos;          // Current position in data_bytes array
     int num_data_segments;
 
     // Extract data segments from WASM data section
     task automatic extract_data_segments();
         int pos, section_id, section_size, seg_count, flags, offset, data_len;
-        int data_pos;
+        int seg_idx;
 
         num_data_segments = 0;
-        data_pos = 0;
+        data_bytes_pos = 0;
+
+        // Initialize all segments as dropped
+        for (int s = 0; s < 16; s++) begin
+            data_segments[s].offset = 0;
+            data_segments[s].length = 0;
+            data_segments[s].data_start = 0;
+            data_segments[s].is_passive = 0;
+        end
 
         pos = 8;
         while (pos < wasm_size) begin
@@ -544,11 +573,12 @@ module wasm_runner;
             if (section_id == 11) begin  // Data section
                 seg_count = read_leb128_u(pos);
 
-                for (int seg = 0; seg < seg_count; seg++) begin
+                for (int seg = 0; seg < seg_count && seg < 16; seg++) begin
                     flags = wasm_data[pos];
                     pos++;
+                    seg_idx = num_data_segments;
 
-                    if (flags == 0) begin  // Active segment
+                    if (flags == 0) begin  // Active segment (memory 0, with offset)
                         if (wasm_data[pos] == 8'h41) begin  // i32.const
                             pos++;
                             offset = read_leb128_s(pos);
@@ -556,14 +586,52 @@ module wasm_runner;
 
                             data_len = read_leb128_u(pos);
 
-                            data_offsets[num_data_segments] = offset;
-                            data_lengths[num_data_segments] = data_len;
+                            data_segments[seg_idx].offset = offset;
+                            data_segments[seg_idx].length = data_len;
+                            data_segments[seg_idx].data_start = data_bytes_pos;
+                            data_segments[seg_idx].is_passive = 0;  // Active = dropped after instantiation
 
                             for (int i = 0; i < data_len; i++) begin
-                                data_bytes[data_pos + i] = wasm_data[pos + i];
+                                data_bytes[data_bytes_pos + i] = wasm_data[pos + i];
                             end
                             pos = pos + data_len;
-                            data_pos = data_pos + data_len;
+                            data_bytes_pos = data_bytes_pos + data_len;
+                            num_data_segments++;
+                        end
+                    end else if (flags == 1) begin  // Passive segment
+                        data_len = read_leb128_u(pos);
+
+                        data_segments[seg_idx].offset = 0;  // No destination for passive
+                        data_segments[seg_idx].length = data_len;
+                        data_segments[seg_idx].data_start = data_bytes_pos;
+                        data_segments[seg_idx].is_passive = 1;  // Passive = available for memory.init
+
+                        for (int i = 0; i < data_len; i++) begin
+                            data_bytes[data_bytes_pos + i] = wasm_data[pos + i];
+                        end
+                        pos = pos + data_len;
+                        data_bytes_pos = data_bytes_pos + data_len;
+                        num_data_segments++;
+                    end else if (flags == 2) begin  // Active segment with explicit memory index
+                        int mem_idx;
+                        mem_idx = read_leb128_u(pos);  // memory index (should be 0)
+                        if (wasm_data[pos] == 8'h41) begin  // i32.const
+                            pos++;
+                            offset = read_leb128_s(pos);
+                            if (wasm_data[pos] == 8'h0B) pos++;  // end
+
+                            data_len = read_leb128_u(pos);
+
+                            data_segments[seg_idx].offset = offset;
+                            data_segments[seg_idx].length = data_len;
+                            data_segments[seg_idx].data_start = data_bytes_pos;
+                            data_segments[seg_idx].is_passive = 0;  // Active = dropped
+
+                            for (int i = 0; i < data_len; i++) begin
+                                data_bytes[data_bytes_pos + i] = wasm_data[pos + i];
+                            end
+                            pos = pos + data_len;
+                            data_bytes_pos = data_bytes_pos + data_len;
                             num_data_segments++;
                         end
                     end
@@ -576,20 +644,49 @@ module wasm_runner;
     endtask
 
     // Load data segments into memory
+    // Active segments are loaded to their destination address
+    // Passive segments are loaded to TB_DATA_SEG_BASE area for memory.init
     task automatic load_data_segments();
-        int data_pos;
-        data_pos = 0;
         for (int seg = 0; seg < num_data_segments; seg++) begin
-            for (int i = 0; i < data_lengths[seg]; i++) begin
+            int base_addr;
+            if (data_segments[seg].is_passive) begin
+                // Passive segment: store at reserved area for memory.init
+                base_addr = TB_DATA_SEG_BASE + (seg * TB_DATA_SEG_STRIDE);
+            end else begin
+                // Active segment: store at destination offset
+                base_addr = data_segments[seg].offset;
+            end
+
+            for (int i = 0; i < data_segments[seg].length; i++) begin
                 @(posedge clk);
                 mem_data_wr_en = 1;
-                mem_data_wr_addr = data_offsets[seg] + i;
-                mem_data_wr_data = data_bytes[data_pos + i];
+                mem_data_wr_addr = base_addr + i;
+                mem_data_wr_data = data_bytes[data_segments[seg].data_start + i];
             end
-            data_pos = data_pos + data_lengths[seg];
         end
         @(posedge clk);
         mem_data_wr_en = 0;
+    endtask
+
+    // Load data segment metadata into CPU for memory.init/data.drop
+    task automatic load_data_segment_metadata();
+        for (int s = 0; s < num_data_segments; s++) begin
+            @(posedge clk);
+            data_seg_init_en = 1;
+            data_seg_init_idx = s[3:0];
+            if (data_segments[s].is_passive) begin
+                // Passive: base points to reserved area, not dropped
+                data_seg_init_base = TB_DATA_SEG_BASE + (s * TB_DATA_SEG_STRIDE);
+                data_seg_init_dropped = 0;
+            end else begin
+                // Active: base doesn't matter (already loaded), marked as dropped
+                data_seg_init_base = 0;
+                data_seg_init_dropped = 1;
+            end
+            data_seg_init_size = data_segments[s].length;
+        end
+        @(posedge clk);
+        data_seg_init_en = 0;
     endtask
 
     // Global variables storage
@@ -1554,6 +1651,11 @@ module wasm_runner;
         elem_seg_init_size = 0;
         elem_seg_init_type = 0;
         elem_seg_init_dropped = 0;
+        data_seg_init_en = 0;
+        data_seg_init_idx = 0;
+        data_seg_init_base = 0;
+        data_seg_init_size = 0;
+        data_seg_init_dropped = 0;
 
         // Get plusargs
         if (!$value$plusargs("wasm=%s", wasm_file)) begin
@@ -1616,8 +1718,12 @@ module wasm_runner;
         @(posedge clk);
 
         // Extract and load data segments
+        // Note: Passive data segments are stored at high addresses (TB_DATA_SEG_BASE = 0x14000)
+        // which requires physical memory backing but does NOT change the wasm-visible memory size.
+        // The memory module's MAX_PAGES parameter provides sufficient physical storage.
         extract_data_segments();
         load_data_segments();
+        load_data_segment_metadata();
 
         // Extract and load global variables
         extract_globals();

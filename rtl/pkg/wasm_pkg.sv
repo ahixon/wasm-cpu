@@ -532,6 +532,7 @@ package wasm_pkg;
         STATE_TABLE_CACHE_MISS, // Waiting for table entry fetch from memory
         STATE_FILL,             // Fill loop for table.grow/table.fill/memory.fill
         STATE_TABLE_INIT,       // table.init copy loop (read elem segment, write table)
+        STATE_MEMORY_COPY,      // memory.copy/memory.init byte-level copy loop
         STATE_TRAP,
         STATE_HALT,
         STATE_EXT_HALT       // Halted by external supervisor, waiting for resume

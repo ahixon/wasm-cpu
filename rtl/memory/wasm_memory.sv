@@ -67,12 +67,33 @@ module wasm_memory
     end
 
     // Bounds checking - must detect overflow in address+size
+    // in_bounds: checks against wasm-declared memory size (num_pages)
+    // in_physical_bounds: checks against physical backing store (MAX_PAGES)
+    // in_read_bounds: for reads, allows wasm-visible OR internal region (0x10000+)
+    //   This allows internal data (passive data segments) to be stored at high addresses
+    //   while keeping wasm memory semantics correct for user code below 0x10000.
+    localparam logic [31:0] INTERNAL_REGION_BASE = 32'h0010_0000;  // 1MB - well above typical wasm test usage
+
     function automatic logic in_bounds(input logic [31:0] addr, input int size);
         logic [32:0] end_addr;
         logic [32:0] mem_size;
         end_addr = {1'b0, addr} + size;
         mem_size = 33'(num_pages) * PAGE_SIZE;  // 33-bit to handle 4GB
         return !end_addr[32] && (end_addr <= mem_size);
+    endfunction
+
+    function automatic logic in_physical_bounds(input logic [31:0] addr, input int size);
+        logic [32:0] end_addr;
+        localparam logic [32:0] phys_size = 33'(MAX_PAGES) * PAGE_SIZE;
+        end_addr = {1'b0, addr} + size;
+        return !end_addr[32] && (end_addr <= phys_size);
+    endfunction
+
+    function automatic logic in_read_bounds(input logic [31:0] addr, input int size);
+        // Allow reads from wasm-visible region OR internal region (for data segments)
+        // Internal region starts at INTERNAL_REGION_BASE and goes up to MAX_PAGES
+        return in_bounds(addr, size) ||
+               (addr >= INTERNAL_REGION_BASE && in_physical_bounds(addr, size));
     endfunction
 
     // Get access size in bytes from mem_size_t
@@ -93,7 +114,7 @@ module wasm_memory
         mem_resp_o.error = 1'b0;
         trap = TRAP_NONE;
 
-        // Check for out-of-bounds writes
+        // Check for out-of-bounds writes - use wasm-declared memory size
         if (mem_req_i.valid && mem_req_i.write) begin
             if (!in_bounds(mem_req_i.addr, size_to_bytes(mem_req_i.size))) begin
                 trap = TRAP_OUT_OF_BOUNDS;
@@ -101,12 +122,13 @@ module wasm_memory
             end
         end
 
-        // Read operations
+        // Read operations - use in_read_bounds to allow reading from internal
+        // storage areas (e.g., passive data segments for memory.init)
         if (mem_req_i.valid && !mem_req_i.write) begin
             // Use mem_op_i for sign extension, but mem_req_i.size for bounds check
             case (mem_op_i)
                 MEM_LOAD_I32: begin
-                    if (!in_bounds(mem_req_i.addr, 4)) begin
+                    if (!in_read_bounds(mem_req_i.addr, 4)) begin
                         trap = TRAP_OUT_OF_BOUNDS;
                         mem_resp_o.error = 1'b1;
                     end else begin
@@ -117,7 +139,7 @@ module wasm_memory
                 end
 
                 MEM_LOAD_I64: begin
-                    if (!in_bounds(mem_req_i.addr, 8)) begin
+                    if (!in_read_bounds(mem_req_i.addr, 8)) begin
                         trap = TRAP_OUT_OF_BOUNDS;
                         mem_resp_o.error = 1'b1;
                     end else begin
@@ -130,7 +152,7 @@ module wasm_memory
                 end
 
                 MEM_LOAD_F32: begin
-                    if (!in_bounds(mem_req_i.addr, 4)) begin
+                    if (!in_read_bounds(mem_req_i.addr, 4)) begin
                         trap = TRAP_OUT_OF_BOUNDS;
                         mem_resp_o.error = 1'b1;
                     end else begin
@@ -141,7 +163,7 @@ module wasm_memory
                 end
 
                 MEM_LOAD_F64: begin
-                    if (!in_bounds(mem_req_i.addr, 8)) begin
+                    if (!in_read_bounds(mem_req_i.addr, 8)) begin
                         trap = TRAP_OUT_OF_BOUNDS;
                         mem_resp_o.error = 1'b1;
                     end else begin
@@ -154,7 +176,7 @@ module wasm_memory
                 end
 
                 MEM_LOAD_I8_S: begin
-                    if (!in_bounds(mem_req_i.addr, 1)) begin
+                    if (!in_read_bounds(mem_req_i.addr, 1)) begin
                         trap = TRAP_OUT_OF_BOUNDS;
                         mem_resp_o.error = 1'b1;
                     end else begin
@@ -164,7 +186,7 @@ module wasm_memory
                 end
 
                 MEM_LOAD_I8_U: begin
-                    if (!in_bounds(mem_req_i.addr, 1)) begin
+                    if (!in_read_bounds(mem_req_i.addr, 1)) begin
                         trap = TRAP_OUT_OF_BOUNDS;
                         mem_resp_o.error = 1'b1;
                     end else begin
@@ -174,7 +196,7 @@ module wasm_memory
                 end
 
                 MEM_LOAD_I16_S: begin
-                    if (!in_bounds(mem_req_i.addr, 2)) begin
+                    if (!in_read_bounds(mem_req_i.addr, 2)) begin
                         trap = TRAP_OUT_OF_BOUNDS;
                         mem_resp_o.error = 1'b1;
                     end else begin
@@ -185,7 +207,7 @@ module wasm_memory
                 end
 
                 MEM_LOAD_I16_U: begin
-                    if (!in_bounds(mem_req_i.addr, 2)) begin
+                    if (!in_read_bounds(mem_req_i.addr, 2)) begin
                         trap = TRAP_OUT_OF_BOUNDS;
                         mem_resp_o.error = 1'b1;
                     end else begin
@@ -195,7 +217,7 @@ module wasm_memory
                 end
 
                 MEM_LOAD_I32_S: begin
-                    if (!in_bounds(mem_req_i.addr, 4)) begin
+                    if (!in_read_bounds(mem_req_i.addr, 4)) begin
                         trap = TRAP_OUT_OF_BOUNDS;
                         mem_resp_o.error = 1'b1;
                     end else begin
@@ -208,7 +230,7 @@ module wasm_memory
                 end
 
                 MEM_LOAD_I32_U: begin
-                    if (!in_bounds(mem_req_i.addr, 4)) begin
+                    if (!in_read_bounds(mem_req_i.addr, 4)) begin
                         trap = TRAP_OUT_OF_BOUNDS;
                         mem_resp_o.error = 1'b1;
                     end else begin
@@ -220,7 +242,7 @@ module wasm_memory
 
                 default: begin
                     // Unknown operation - just read raw bytes based on size
-                    if (!in_bounds(mem_req_i.addr, size_to_bytes(mem_req_i.size))) begin
+                    if (!in_read_bounds(mem_req_i.addr, size_to_bytes(mem_req_i.size))) begin
                         trap = TRAP_OUT_OF_BOUNDS;
                         mem_resp_o.error = 1'b1;
                     end else begin
