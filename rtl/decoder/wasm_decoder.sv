@@ -384,15 +384,18 @@ module wasm_decoder
                         end
 
                         // table.init - elem_idx + table_idx
+                        // immediate2[15:0] = elem_idx, immediate2[31:16] = table_idx
                         8'h0C: begin
+                            logic [63:0] elem_idx_val, table_idx_val;
                             for (int i = 0; i < 10; i++) begin
                                 leb_bytes[i] = instr_bytes[i+1+len1];
                             end
-                            decoded.immediate2 = decode_uleb128(leb_bytes, len2);  // elem_idx
+                            elem_idx_val = decode_uleb128(leb_bytes, len2);
                             for (int i = 0; i < 10; i++) begin
                                 leb_bytes[i] = instr_bytes[i+1+len1+len2];
                             end
-                            void'(decode_uleb128(leb_bytes, len3));  // table_idx (stored in bits after elem_idx)
+                            table_idx_val = decode_uleb128(leb_bytes, len3);
+                            decoded.immediate2 = {table_idx_val[15:0], elem_idx_val[15:0]};
                             decoded.instr_length = 8'd1 + {4'b0, len1} + {4'b0, len2} + {4'b0, len3};
                             decoded.has_immediate2 = 1'b1;
                         end
@@ -408,15 +411,18 @@ module wasm_decoder
                         end
 
                         // table.copy - dst_table_idx + src_table_idx
+                        // immediate2[15:0] = dst_table, immediate2[31:16] = src_table
                         8'h0E: begin
+                            logic [63:0] dst_table_val, src_table_val;
                             for (int i = 0; i < 10; i++) begin
                                 leb_bytes[i] = instr_bytes[i+1+len1];
                             end
-                            decoded.immediate2 = decode_uleb128(leb_bytes, len2);  // dst_table
+                            dst_table_val = decode_uleb128(leb_bytes, len2);
                             for (int i = 0; i < 10; i++) begin
                                 leb_bytes[i] = instr_bytes[i+1+len1+len2];
                             end
-                            void'(decode_uleb128(leb_bytes, len3));  // src_table (not stored separately)
+                            src_table_val = decode_uleb128(leb_bytes, len3);
+                            decoded.immediate2 = {src_table_val[15:0], dst_table_val[15:0]};
                             decoded.instr_length = 8'd1 + {4'b0, len1} + {4'b0, len2} + {4'b0, len3};
                             decoded.has_immediate2 = 1'b1;
                         end

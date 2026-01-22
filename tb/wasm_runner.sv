@@ -60,6 +60,14 @@ module wasm_runner;
     logic [15:0] elem_init_idx;
     logic [31:0] elem_init_value;
 
+    // Element segment metadata initialization interface
+    logic        elem_seg_init_en;
+    logic [3:0]  elem_seg_init_idx;
+    logic [31:0] elem_seg_init_base;
+    logic [15:0] elem_seg_init_size;
+    logic [3:0]  elem_seg_init_type;
+    logic        elem_seg_init_dropped;
+
     // Table base address configuration
     // Tables are stored in linear memory at these base addresses
     // Use addresses within the first 64KB page to avoid bounds issues
@@ -67,6 +75,13 @@ module wasm_runner;
     // This ensures all 4 tables fit within 32KB (0x8000-0xFFFF)
     localparam logic [31:0] TB_TABLE_BASE = 32'h0000_8000;  // 32KB offset
     localparam int TB_TABLE_STRIDE = 32'h0000_2000;         // 8KB per table (2048 entries max)
+
+    // Element segment base address configuration
+    // Element segments are stored after tables: 0x10000 + (seg_idx * 0x400)
+    // Each segment has up to 256 elements (1KB), supporting 16 segments
+    localparam logic [31:0] TB_ELEM_SEG_BASE = 32'h0001_0000;  // 64KB offset
+    localparam int TB_ELEM_SEG_STRIDE = 32'h0000_0400;          // 1KB per segment (256 entries max)
+
     logic type_init_en;
     logic [7:0] type_init_idx;
     logic [7:0] type_init_param_count;
@@ -683,6 +698,17 @@ module wasm_runner;
     logic [7:0] table_types [0:3];   // Element types (0x70=funcref, 0x6F=externref)
     int current_table_size [0:3];    // Current runtime size of each table (for table.grow tracking)
 
+    // Element segment storage (for table.init) - support up to 16 segments
+    // Segment data is stored in memory starting at TB_ELEM_SEG_BASE
+    typedef struct {
+        int entries [0:255];         // Function indices in this segment
+        int size;                    // Number of entries
+        logic [7:0] elem_type;       // Element type (0x70=funcref, 0x6F=externref)
+        logic is_passive;            // 1 = passive (available for table.init), 0 = active/declarative (dropped)
+    } elem_seg_info_t;
+    elem_seg_info_t elem_segments [0:15];
+    int num_elem_segments;           // Total number of element segments in module
+
     // Extract table section from WASM (section 4) to get table sizes and types
     task automatic extract_tables();
         int pos, section_id, section_size, table_count;
@@ -752,15 +778,28 @@ module wasm_runner;
 
     // Extract element section from WASM (section 9)
     // Must be called AFTER extract_tables() to have proper table sizes
+    // Stores both table entries (for active segments) and segment metadata (for table.init)
     task automatic extract_elements();
         int pos, section_id, section_size, elem_count;
         int flags, table_idx, offset_val, num_funcs;
         int opcode, elemtype;
+        int seg_idx;  // Current segment index
 
-        // Initialize all table entries to null (but preserve num_elements from table section)
+        // Initialize all table entries to null
         for (int t = 0; t < 4; t++) begin
             for (int i = 0; i < 256; i++) begin
                 elem_entries[t][i] = -1;  // -1 = null reference
+            end
+        end
+
+        // Initialize all element segments
+        num_elem_segments = 0;
+        for (int s = 0; s < 16; s++) begin
+            elem_segments[s].size = 0;
+            elem_segments[s].elem_type = 8'h70;  // funcref default
+            elem_segments[s].is_passive = 0;
+            for (int i = 0; i < 256; i++) begin
+                elem_segments[s].entries[i] = -1;
             end
         end
 
@@ -772,13 +811,15 @@ module wasm_runner;
 
             if (section_id == 9) begin  // Element section
                 elem_count = read_leb128_u(pos);
+                num_elem_segments = (elem_count > 16) ? 16 : elem_count;
 
-                for (int e = 0; e < elem_count; e++) begin
+                for (seg_idx = 0; seg_idx < elem_count; seg_idx++) begin
                     // Element segment format depends on flags
                     flags = read_leb128_u(pos);
 
                     if (flags == 0) begin
                         // flags=0: Active, table 0, offset expr, vec of func idx
+                        // Active segments are implicitly dropped after instantiation
                         table_idx = 0;
                         opcode = wasm_data[pos];
                         pos++;
@@ -790,125 +831,16 @@ module wasm_runner;
                         if (wasm_data[pos] == 8'h0B) pos++;  // end
 
                         num_funcs = read_leb128_u(pos);
+                        if (seg_idx < 16) begin
+                            elem_segments[seg_idx].size = num_funcs;
+                            elem_segments[seg_idx].elem_type = 8'h70;
+                            elem_segments[seg_idx].is_passive = 0;  // Active = dropped
+                        end
+
                         for (int f = 0; f < num_funcs; f++) begin
                             int func_idx_val;
                             func_idx_val = read_leb128_u(pos);
-                            if (offset_val + f < 256 && table_idx < 4) begin
-                                elem_entries[table_idx][offset_val + f] = func_idx_val;
-                                if (offset_val + f + 1 > num_elements[table_idx]) begin
-                                    num_elements[table_idx] = offset_val + f + 1;
-                                end
-                            end
-                        end
-                    end else if (flags == 4) begin
-                        // flags=4: Active, table 0, offset expr, vec of elem exprs (ref.func idx)
-                        table_idx = 0;
-                        opcode = wasm_data[pos];
-                        pos++;
-                        if (opcode == 8'h41) begin  // i32.const
-                            offset_val = read_leb128_s(pos);
-                        end else begin
-                            offset_val = 0;
-                        end
-                        if (wasm_data[pos] == 8'h0B) pos++;  // end
-
-                        num_funcs = read_leb128_u(pos);
-                        for (int f = 0; f < num_funcs; f++) begin
-                            int func_idx_val;
-                            opcode = wasm_data[pos];
-                            pos++;
-                            if (opcode == 8'hD2) begin  // ref.func
-                                func_idx_val = read_leb128_u(pos);
-                                if (wasm_data[pos] == 8'h0B) pos++;  // end
-                                if (offset_val + f < 256 && table_idx < 4) begin
-                                    elem_entries[table_idx][offset_val + f] = func_idx_val;
-                                    if (offset_val + f + 1 > num_elements[table_idx]) begin
-                                        num_elements[table_idx] = offset_val + f + 1;
-                                    end
-                                end
-                            end else if (opcode == 8'hD0) begin  // ref.null
-                                // Read the type (funcref = 0x70)
-                                read_leb128_u(pos);
-                                if (wasm_data[pos] == 8'h0B) pos++;  // end
-                                // Store as -1 to indicate null/uninitialized
-                                if (offset_val + f < 256 && table_idx < 4) begin
-                                    elem_entries[table_idx][offset_val + f] = -1;
-                                    if (offset_val + f + 1 > num_elements[table_idx]) begin
-                                        num_elements[table_idx] = offset_val + f + 1;
-                                    end
-                                end
-                            end else begin
-                                // Skip unknown expression
-                                if (wasm_data[pos] == 8'h0B) pos++;
-                            end
-                        end
-                    end else if (flags == 6) begin
-                        // flags=6: Active, explicit table, offset expr, elemtype, vec of elem exprs
-                        table_idx = read_leb128_u(pos);  // Read table index
-                        opcode = wasm_data[pos];
-                        pos++;
-                        if (opcode == 8'h41) begin  // i32.const
-                            offset_val = read_leb128_s(pos);
-                        end else begin
-                            offset_val = 0;
-                        end
-                        if (wasm_data[pos] == 8'h0B) pos++;  // end
-
-                        // Read elemtype (0x70=funcref, 0x6F=externref, 0x63=ref null, 0x64=ref)
-                        elemtype = wasm_data[pos];
-                        pos++;
-                        // Handle typed refs (0x63 ref null heaptype, 0x64 ref heaptype)
-                        if (elemtype == 8'h63 || elemtype == 8'h64) begin
-                            read_leb128_s(pos);  // skip heaptype
-                        end
-
-                        num_funcs = read_leb128_u(pos);
-                        for (int f = 0; f < num_funcs; f++) begin
-                            int func_idx_val;
-                            opcode = wasm_data[pos];
-                            pos++;
-                            if (opcode == 8'hD2) begin  // ref.func
-                                func_idx_val = read_leb128_u(pos);
-                                if (wasm_data[pos] == 8'h0B) pos++;  // end
-                                if (offset_val + f < 256 && table_idx < 4) begin
-                                    elem_entries[table_idx][offset_val + f] = func_idx_val;
-                                    if (offset_val + f + 1 > num_elements[table_idx]) begin
-                                        num_elements[table_idx] = offset_val + f + 1;
-                                    end
-                                end
-                            end else if (opcode == 8'hD0) begin  // ref.null
-                                read_leb128_u(pos);
-                                if (wasm_data[pos] == 8'h0B) pos++;  // end
-                                if (offset_val + f < 256 && table_idx < 4) begin
-                                    elem_entries[table_idx][offset_val + f] = -1;
-                                    if (offset_val + f + 1 > num_elements[table_idx]) begin
-                                        num_elements[table_idx] = offset_val + f + 1;
-                                    end
-                                end
-                            end else begin
-                                if (wasm_data[pos] == 8'h0B) pos++;
-                            end
-                        end
-                    end else if (flags == 2) begin
-                        // flags=2: Active, explicit table, offset expr, elemkind, vec of funcidx
-                        table_idx = read_leb128_u(pos);  // Read table index
-                        opcode = wasm_data[pos];
-                        pos++;
-                        if (opcode == 8'h41) begin  // i32.const
-                            offset_val = read_leb128_s(pos);
-                        end else begin
-                            offset_val = 0;
-                        end
-                        if (wasm_data[pos] == 8'h0B) pos++;  // end
-
-                        // Read elemkind (0x00 = funcref)
-                        elemtype = wasm_data[pos];
-                        pos++;
-
-                        num_funcs = read_leb128_u(pos);
-                        for (int f = 0; f < num_funcs; f++) begin
-                            int func_idx_val;
-                            func_idx_val = read_leb128_u(pos);
+                            if (seg_idx < 16) elem_segments[seg_idx].entries[f] = func_idx_val;
                             if (offset_val + f < 256 && table_idx < 4) begin
                                 elem_entries[table_idx][offset_val + f] = func_idx_val;
                                 if (offset_val + f + 1 > num_elements[table_idx]) begin
@@ -918,50 +850,234 @@ module wasm_runner;
                         end
                     end else if (flags == 1) begin
                         // flags=1: Passive, elemkind, vec of funcidx
-                        // Skip: elemkind (1 byte) + vec of funcidx
-                        pos++;  // elemkind
+                        elemtype = wasm_data[pos];
+                        pos++;  // elemkind (0x00 = funcref)
+
                         num_funcs = read_leb128_u(pos);
+                        if (seg_idx < 16) begin
+                            elem_segments[seg_idx].size = num_funcs;
+                            elem_segments[seg_idx].elem_type = 8'h70;  // funcref
+                            elem_segments[seg_idx].is_passive = 1;  // Passive = available
+                        end
+
                         for (int f = 0; f < num_funcs; f++) begin
-                            read_leb128_u(pos);  // skip funcidx
+                            int func_idx_val;
+                            func_idx_val = read_leb128_u(pos);
+                            if (seg_idx < 16) elem_segments[seg_idx].entries[f] = func_idx_val;
+                        end
+                    end else if (flags == 2) begin
+                        // flags=2: Active, explicit table, offset expr, elemkind, vec of funcidx
+                        table_idx = read_leb128_u(pos);
+                        opcode = wasm_data[pos];
+                        pos++;
+                        if (opcode == 8'h41) begin
+                            offset_val = read_leb128_s(pos);
+                        end else begin
+                            offset_val = 0;
+                        end
+                        if (wasm_data[pos] == 8'h0B) pos++;
+
+                        elemtype = wasm_data[pos];
+                        pos++;  // elemkind
+
+                        num_funcs = read_leb128_u(pos);
+                        if (seg_idx < 16) begin
+                            elem_segments[seg_idx].size = num_funcs;
+                            elem_segments[seg_idx].elem_type = 8'h70;
+                            elem_segments[seg_idx].is_passive = 0;  // Active = dropped
+                        end
+
+                        for (int f = 0; f < num_funcs; f++) begin
+                            int func_idx_val;
+                            func_idx_val = read_leb128_u(pos);
+                            if (seg_idx < 16) elem_segments[seg_idx].entries[f] = func_idx_val;
+                            if (offset_val + f < 256 && table_idx < 4) begin
+                                elem_entries[table_idx][offset_val + f] = func_idx_val;
+                                if (offset_val + f + 1 > num_elements[table_idx]) begin
+                                    num_elements[table_idx] = offset_val + f + 1;
+                                end
+                            end
                         end
                     end else if (flags == 3) begin
-                        // flags=3: Passive, elemkind, vec of funcidx (same as flags=1)
+                        // flags=3: Declarative, elemkind, vec of funcidx
+                        elemtype = wasm_data[pos];
                         pos++;  // elemkind
+
                         num_funcs = read_leb128_u(pos);
+                        if (seg_idx < 16) begin
+                            elem_segments[seg_idx].size = num_funcs;
+                            elem_segments[seg_idx].elem_type = 8'h70;
+                            elem_segments[seg_idx].is_passive = 0;  // Declarative = dropped
+                        end
+
                         for (int f = 0; f < num_funcs; f++) begin
-                            read_leb128_u(pos);  // skip funcidx
+                            int func_idx_val;
+                            func_idx_val = read_leb128_u(pos);
+                            if (seg_idx < 16) elem_segments[seg_idx].entries[f] = func_idx_val;
+                        end
+                    end else if (flags == 4) begin
+                        // flags=4: Active, table 0, offset expr, vec of elem exprs
+                        table_idx = 0;
+                        opcode = wasm_data[pos];
+                        pos++;
+                        if (opcode == 8'h41) begin
+                            offset_val = read_leb128_s(pos);
+                        end else begin
+                            offset_val = 0;
+                        end
+                        if (wasm_data[pos] == 8'h0B) pos++;
+
+                        num_funcs = read_leb128_u(pos);
+                        if (seg_idx < 16) begin
+                            elem_segments[seg_idx].size = num_funcs;
+                            elem_segments[seg_idx].elem_type = 8'h70;
+                            elem_segments[seg_idx].is_passive = 0;  // Active = dropped
+                        end
+
+                        for (int f = 0; f < num_funcs; f++) begin
+                            int func_idx_val;
+                            opcode = wasm_data[pos];
+                            pos++;
+                            if (opcode == 8'hD2) begin  // ref.func
+                                func_idx_val = read_leb128_u(pos);
+                                if (wasm_data[pos] == 8'h0B) pos++;
+                                if (seg_idx < 16) elem_segments[seg_idx].entries[f] = func_idx_val;
+                                if (offset_val + f < 256 && table_idx < 4) begin
+                                    elem_entries[table_idx][offset_val + f] = func_idx_val;
+                                    if (offset_val + f + 1 > num_elements[table_idx]) begin
+                                        num_elements[table_idx] = offset_val + f + 1;
+                                    end
+                                end
+                            end else if (opcode == 8'hD0) begin  // ref.null
+                                read_leb128_u(pos);
+                                if (wasm_data[pos] == 8'h0B) pos++;
+                                if (seg_idx < 16) elem_segments[seg_idx].entries[f] = -1;
+                                if (offset_val + f < 256 && table_idx < 4) begin
+                                    elem_entries[table_idx][offset_val + f] = -1;
+                                    if (offset_val + f + 1 > num_elements[table_idx]) begin
+                                        num_elements[table_idx] = offset_val + f + 1;
+                                    end
+                                end
+                            end else begin
+                                if (wasm_data[pos] == 8'h0B) pos++;
+                            end
                         end
                     end else if (flags == 5) begin
                         // flags=5: Passive, elemtype, vec of elem exprs
-                        pos++;  // elemtype
+                        elemtype = wasm_data[pos];
+                        pos++;
+                        if (elemtype == 8'h63 || elemtype == 8'h64) begin
+                            read_leb128_s(pos);  // skip heaptype
+                        end
+
                         num_funcs = read_leb128_u(pos);
+                        if (seg_idx < 16) begin
+                            elem_segments[seg_idx].size = num_funcs;
+                            elem_segments[seg_idx].elem_type = (elemtype == 8'h6F) ? 8'h6F : 8'h70;
+                            elem_segments[seg_idx].is_passive = 1;  // Passive = available
+                        end
+
                         for (int f = 0; f < num_funcs; f++) begin
-                            // Skip element expression until 0x0B (end)
-                            while (wasm_data[pos] != 8'h0B && pos < wasm_size) begin
-                                if (wasm_data[pos] == 8'hD2 || wasm_data[pos] == 8'hD0) begin
-                                    pos++;  // skip opcode
-                                    read_leb128_u(pos);  // skip argument
-                                end else begin
-                                    pos++;
-                                end
+                            int func_idx_val;
+                            opcode = wasm_data[pos];
+                            pos++;
+                            if (opcode == 8'hD2) begin  // ref.func
+                                func_idx_val = read_leb128_u(pos);
+                                if (wasm_data[pos] == 8'h0B) pos++;
+                                if (seg_idx < 16) elem_segments[seg_idx].entries[f] = func_idx_val;
+                            end else if (opcode == 8'hD0) begin  // ref.null
+                                read_leb128_u(pos);
+                                if (wasm_data[pos] == 8'h0B) pos++;
+                                if (seg_idx < 16) elem_segments[seg_idx].entries[f] = -1;
+                            end else begin
+                                while (wasm_data[pos] != 8'h0B && pos < wasm_size) pos++;
+                                if (wasm_data[pos] == 8'h0B) pos++;
                             end
-                            if (wasm_data[pos] == 8'h0B) pos++;  // end
+                        end
+                    end else if (flags == 6) begin
+                        // flags=6: Active, explicit table, offset expr, elemtype, vec of elem exprs
+                        table_idx = read_leb128_u(pos);
+                        opcode = wasm_data[pos];
+                        pos++;
+                        if (opcode == 8'h41) begin
+                            offset_val = read_leb128_s(pos);
+                        end else begin
+                            offset_val = 0;
+                        end
+                        if (wasm_data[pos] == 8'h0B) pos++;
+
+                        elemtype = wasm_data[pos];
+                        pos++;
+                        if (elemtype == 8'h63 || elemtype == 8'h64) begin
+                            read_leb128_s(pos);
+                        end
+
+                        num_funcs = read_leb128_u(pos);
+                        if (seg_idx < 16) begin
+                            elem_segments[seg_idx].size = num_funcs;
+                            elem_segments[seg_idx].elem_type = (elemtype == 8'h6F) ? 8'h6F : 8'h70;
+                            elem_segments[seg_idx].is_passive = 0;  // Active = dropped
+                        end
+
+                        for (int f = 0; f < num_funcs; f++) begin
+                            int func_idx_val;
+                            opcode = wasm_data[pos];
+                            pos++;
+                            if (opcode == 8'hD2) begin
+                                func_idx_val = read_leb128_u(pos);
+                                if (wasm_data[pos] == 8'h0B) pos++;
+                                if (seg_idx < 16) elem_segments[seg_idx].entries[f] = func_idx_val;
+                                if (offset_val + f < 256 && table_idx < 4) begin
+                                    elem_entries[table_idx][offset_val + f] = func_idx_val;
+                                    if (offset_val + f + 1 > num_elements[table_idx]) begin
+                                        num_elements[table_idx] = offset_val + f + 1;
+                                    end
+                                end
+                            end else if (opcode == 8'hD0) begin
+                                read_leb128_u(pos);
+                                if (wasm_data[pos] == 8'h0B) pos++;
+                                if (seg_idx < 16) elem_segments[seg_idx].entries[f] = -1;
+                                if (offset_val + f < 256 && table_idx < 4) begin
+                                    elem_entries[table_idx][offset_val + f] = -1;
+                                    if (offset_val + f + 1 > num_elements[table_idx]) begin
+                                        num_elements[table_idx] = offset_val + f + 1;
+                                    end
+                                end
+                            end else begin
+                                if (wasm_data[pos] == 8'h0B) pos++;
+                            end
                         end
                     end else if (flags == 7) begin
                         // flags=7: Declarative, elemtype, vec of elem exprs
-                        pos++;  // elemtype
+                        elemtype = wasm_data[pos];
+                        pos++;
+                        if (elemtype == 8'h63 || elemtype == 8'h64) begin
+                            read_leb128_s(pos);
+                        end
+
                         num_funcs = read_leb128_u(pos);
+                        if (seg_idx < 16) begin
+                            elem_segments[seg_idx].size = num_funcs;
+                            elem_segments[seg_idx].elem_type = (elemtype == 8'h6F) ? 8'h6F : 8'h70;
+                            elem_segments[seg_idx].is_passive = 0;  // Declarative = dropped
+                        end
+
                         for (int f = 0; f < num_funcs; f++) begin
-                            // Skip element expression until 0x0B (end)
-                            while (wasm_data[pos] != 8'h0B && pos < wasm_size) begin
-                                if (wasm_data[pos] == 8'hD2 || wasm_data[pos] == 8'hD0) begin
-                                    pos++;  // skip opcode
-                                    read_leb128_u(pos);  // skip argument
-                                end else begin
-                                    pos++;
-                                end
+                            int func_idx_val;
+                            opcode = wasm_data[pos];
+                            pos++;
+                            if (opcode == 8'hD2) begin
+                                func_idx_val = read_leb128_u(pos);
+                                if (wasm_data[pos] == 8'h0B) pos++;
+                                if (seg_idx < 16) elem_segments[seg_idx].entries[f] = func_idx_val;
+                            end else if (opcode == 8'hD0) begin
+                                read_leb128_u(pos);
+                                if (wasm_data[pos] == 8'h0B) pos++;
+                                if (seg_idx < 16) elem_segments[seg_idx].entries[f] = -1;
+                            end else begin
+                                while (wasm_data[pos] != 8'h0B && pos < wasm_size) pos++;
+                                if (wasm_data[pos] == 8'h0B) pos++;
                             end
-                            if (wasm_data[pos] == 8'h0B) pos++;  // end
                         end
                     end else begin
                         // Unknown flags - try to continue but warn
@@ -1015,7 +1131,6 @@ module wasm_runner;
                 elem_addr = base_addr + (e << 2);  // base + e * 4
                 // Convert -1 (null) to REF_NULL_VALUE (0xFFFFFFFF)
                 elem_val = (elem_entries[t][e] == -1) ? 32'hFFFFFFFF : elem_entries[t][e][31:0];
-
                 // Write 4 bytes directly to linear memory (little-endian)
                 // wasm_memory uses byte-addressable memory
                 linear_memory.mem[elem_addr + 0] = elem_val[7:0];
@@ -1026,6 +1141,49 @@ module wasm_runner;
         end
         // No clock cycles needed - direct memory access
         elem_init_en = 0;
+    endtask
+
+    // Load element segment data into linear memory (for table.init)
+    // Element segments are stored at TB_ELEM_SEG_BASE + (seg_idx * TB_ELEM_SEG_STRIDE)
+    task automatic load_elem_segments();
+        automatic logic [31:0] base_addr;
+        automatic logic [31:0] elem_addr;
+        automatic logic [31:0] elem_val;
+
+        for (int s = 0; s < num_elem_segments && s < 16; s++) begin
+            base_addr = TB_ELEM_SEG_BASE + (s * TB_ELEM_SEG_STRIDE);
+            for (int e = 0; e < elem_segments[s].size && e < 256; e++) begin
+                elem_addr = base_addr + (e << 2);  // base + e * 4
+                // Convert -1 (null) to REF_NULL_VALUE (0xFFFFFFFF)
+                elem_val = (elem_segments[s].entries[e] == -1) ? 32'hFFFFFFFF : elem_segments[s].entries[e][31:0];
+
+                // Write 4 bytes directly to linear memory (little-endian)
+                linear_memory.mem[elem_addr + 0] = elem_val[7:0];
+                linear_memory.mem[elem_addr + 1] = elem_val[15:8];
+                linear_memory.mem[elem_addr + 2] = elem_val[23:16];
+                linear_memory.mem[elem_addr + 3] = elem_val[31:24];
+            end
+        end
+    endtask
+
+    // Load element segment metadata into CPU (for table.init/elem.drop)
+    task automatic load_elem_seg_metadata();
+        for (int s = 0; s < num_elem_segments && s < 16; s++) begin
+            @(posedge clk);
+            elem_seg_init_en = 1;
+            elem_seg_init_idx = s[3:0];
+            elem_seg_init_base = TB_ELEM_SEG_BASE + (s * TB_ELEM_SEG_STRIDE);
+            elem_seg_init_size = elem_segments[s].size[15:0];
+            // Map elem_type (0x70=funcref, 0x6F=externref) to valtype_t
+            case (elem_segments[s].elem_type)
+                8'h6F: elem_seg_init_type = 4'h6;  // TYPE_EXTERNREF
+                default: elem_seg_init_type = 4'h5;  // TYPE_FUNCREF
+            endcase
+            // Active/declarative segments are dropped; passive are not
+            elem_seg_init_dropped = !elem_segments[s].is_passive;
+        end
+        @(posedge clk);
+        elem_seg_init_en = 0;
     endtask
 
     // Load types into the CPU's type table (for multi-value block types)
@@ -1390,6 +1548,12 @@ module wasm_runner;
         elem_init_table_idx = 0;
         elem_init_idx = 0;
         elem_init_value = 0;
+        elem_seg_init_en = 0;
+        elem_seg_init_idx = 0;
+        elem_seg_init_base = 0;
+        elem_seg_init_size = 0;
+        elem_seg_init_type = 0;
+        elem_seg_init_dropped = 0;
 
         // Get plusargs
         if (!$value$plusargs("wasm=%s", wasm_file)) begin
@@ -1480,6 +1644,18 @@ module wasm_runner;
 
         load_table_metadata();
         load_elements();
+
+        // Load element segment data and metadata for table.init/elem.drop
+        // Element segments are stored at 0x10000+ (requires 2+ pages)
+        // Only load if we have enough memory to avoid breaking tests
+        if (num_elem_segments > 0 && init_mem_pages >= 2) begin
+            load_elem_segments();
+            load_elem_seg_metadata();
+        end else if (num_elem_segments > 0) begin
+            // Initialize metadata only (segments won't be accessible for table.init,
+            // but elem.drop will work for dropping active/declarative segments)
+            load_elem_seg_metadata();
+        end
 
         if (use_testlist) begin
             // Multi-test mode: extract all functions

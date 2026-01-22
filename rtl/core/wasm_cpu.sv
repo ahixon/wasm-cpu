@@ -72,6 +72,15 @@ module wasm_cpu
     input  logic [15:0] elem_init_idx,
     input  logic [31:0] elem_init_value,      // Reference value (funcref/externref)
 
+    // Element segment metadata initialization interface (for table.init/elem.drop)
+    // Element segments are stored in linear memory; this interface sets up metadata
+    input  logic        elem_seg_init_en,
+    input  logic [3:0]  elem_seg_init_idx,    // Which segment (0-15)
+    input  logic [31:0] elem_seg_init_base,   // Base address in linear memory
+    input  logic [15:0] elem_seg_init_size,   // Number of elements in segment
+    input  logic [3:0]  elem_seg_init_type,   // Element type (funcref/externref)
+    input  logic        elem_seg_init_dropped, // 1 = segment is already dropped (active/declarative)
+
     // Type table initialization interface (for multi-value block types)
     input  logic        type_init_en,
     input  logic [7:0]  type_init_idx,
@@ -288,6 +297,26 @@ module wasm_cpu
     logic [1:0]  fill_table_idx;      // Table index (for cache invalidation)
     logic        fill_is_table;       // 1=table (4-byte stride), 0=memory (1-byte stride)
     logic        fill_wait_write;     // Waiting for memory write completion
+
+    // =========================================================================
+    // Element Segment Metadata (for table.init/elem.drop)
+    // =========================================================================
+    // Element segments store function/extern references that can be copied to tables
+    // via table.init. Active/declarative segments are marked as dropped at instantiation.
+
+    logic [31:0] elem_seg_base [0:15];    // Base address in memory per segment
+    logic [15:0] elem_seg_size [0:15];    // Number of elements per segment
+    logic [3:0]  elem_seg_type [0:15];    // Element type (funcref/externref)
+    logic [15:0] elem_seg_dropped;        // Bitfield: 1 = segment is dropped
+
+    // table.init copy operation state
+    logic [31:0] init_src_addr;           // Current source address (element segment)
+    logic [31:0] init_dst_addr;           // Current destination address (table)
+    logic [31:0] init_count;              // Remaining elements to copy
+    logic [1:0]  init_table_idx;          // Destination table index
+    logic        init_wait_read;          // Waiting for memory read
+    logic        init_wait_write;         // Waiting for memory write
+    logic [31:0] init_read_data;          // Data read from element segment
 
     // =========================================================================
     // Operand Stack
@@ -790,6 +819,30 @@ module wasm_cpu
             type_table[type_init_idx].result_count <= type_init_result_count;
             type_table[type_init_idx].param_types <= type_init_param_types;
             type_table[type_init_idx].result_types <= type_init_result_types;
+        end
+    end
+
+    // =========================================================================
+    // Element Segment Metadata Interface (for table.init/elem.drop)
+    // =========================================================================
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            // Initialize all element segments to empty/dropped
+            for (int e = 0; e < 16; e++) begin
+                elem_seg_base[e] <= 32'h0;
+                elem_seg_size[e] <= 16'h0;
+                elem_seg_type[e] <= TYPE_FUNCREF;
+            end
+            elem_seg_dropped <= 16'hFFFF;  // All segments start as "dropped"
+        end else if (elem_seg_init_en) begin
+            elem_seg_base[elem_seg_init_idx] <= elem_seg_init_base;
+            elem_seg_size[elem_seg_init_idx] <= elem_seg_init_size;
+            elem_seg_type[elem_seg_init_idx] <= elem_seg_init_type;
+            // Set or clear the dropped bit based on segment type
+            if (elem_seg_init_dropped)
+                elem_seg_dropped[elem_seg_init_idx] <= 1'b1;
+            else
+                elem_seg_dropped[elem_seg_init_idx] <= 1'b0;
         end
     end
 
@@ -2516,9 +2569,83 @@ module wasm_cpu
                                     end
                                 end
 
-                                // 0x0C: table.init, 0x0D: elem.drop, 0x0E: table.copy
-                                // These require element segment handling - trap for now
-                                FC_TABLE_INIT, FC_ELEM_DROP, FC_TABLE_COPY: begin
+                                // 0x0C: table.init - copy from element segment to table
+                                // Stack: [dest, src, count] -> []
+                                // immediate2[15:0] = elem_idx, immediate2[31:16] = table_idx
+                                FC_TABLE_INIT: begin
+                                    logic [3:0]  ti_elem_idx;
+                                    logic [1:0]  ti_table_idx;
+                                    logic [31:0] ti_dest;     // destination offset in table
+                                    logic [31:0] ti_src;      // source offset in element segment
+                                    logic [31:0] ti_count;    // number of elements to copy
+                                    logic [15:0] ti_seg_size;
+                                    logic [15:0] ti_tbl_size;
+
+                                    ti_elem_idx = saved_decoded.immediate2[3:0];
+                                    ti_table_idx = saved_decoded.immediate2[17:16];
+                                    ti_dest = operand_c.value[31:0];   // TOS-2 = dest
+                                    ti_src = operand_b.value[31:0];    // TOS-1 = src
+                                    ti_count = operand_a.value[31:0];  // TOS = count
+                                    ti_seg_size = elem_seg_size[ti_elem_idx];
+                                    ti_tbl_size = table_metadata_size[ti_table_idx];
+
+                                    stack_multi_pop_en <= 1'b1;
+                                    stack_multi_pop_count <= 8'd3;
+
+                                    // Check if segment is dropped (active/declarative segments are pre-dropped)
+                                    if (elem_seg_dropped[ti_elem_idx]) begin
+                                        trapped <= 1'b1;
+                                        trap_code <= TRAP_OUT_OF_BOUNDS;
+                                        state <= STATE_TRAP;
+                                    end
+                                    // Bounds check on source (element segment)
+                                    else if ((ti_src + ti_count) > {16'b0, ti_seg_size} ||
+                                             (ti_src + ti_count) < ti_src) begin
+                                        trapped <= 1'b1;
+                                        trap_code <= TRAP_OUT_OF_BOUNDS;
+                                        state <= STATE_TRAP;
+                                    end
+                                    // Bounds check on destination (table)
+                                    else if ((ti_dest + ti_count) > {16'b0, ti_tbl_size} ||
+                                             (ti_dest + ti_count) < ti_dest) begin
+                                        trapped <= 1'b1;
+                                        trap_code <= TRAP_OUT_OF_BOUNDS;
+                                        state <= STATE_TRAP;
+                                    end
+                                    // Zero count is a valid no-op
+                                    else if (ti_count == 0) begin
+                                        pc <= saved_next_pc;
+                                        state <= STATE_FETCH;
+                                    end
+                                    // Start copy loop
+                                    else begin
+                                        init_src_addr <= elem_seg_base[ti_elem_idx] + (ti_src << 2);
+                                        init_dst_addr <= table_base[ti_table_idx] + (ti_dest << 2);
+                                        init_count <= ti_count;
+                                        init_table_idx <= ti_table_idx;
+                                        init_wait_read <= 1'b0;
+                                        init_wait_write <= 1'b0;
+                                        pc <= saved_next_pc;
+                                        state <= STATE_TABLE_INIT;
+                                    end
+                                end
+
+                                // 0x0D: elem.drop - mark element segment as dropped
+                                // Stack: [] -> []
+                                // immediate2 = elem_idx
+                                FC_ELEM_DROP: begin
+                                    logic [3:0] ed_elem_idx;
+                                    ed_elem_idx = saved_decoded.immediate2[3:0];
+
+                                    // Mark segment as dropped (idempotent - dropping twice is ok)
+                                    elem_seg_dropped[ed_elem_idx] <= 1'b1;
+                                    pc <= saved_next_pc;
+                                    state <= STATE_FETCH;
+                                end
+
+                                // 0x0E: table.copy - copy between tables
+                                // Not yet implemented - trap for now
+                                FC_TABLE_COPY: begin
                                     trapped <= 1'b1;
                                     trap_code <= TRAP_UNREACHABLE;
                                     state <= STATE_TRAP;
@@ -3287,6 +3414,64 @@ module wasm_cpu
                             mem_wr_op <= fill_is_table ? MEM_STORE_I32 : MEM_STORE_I8;
                             mem_wr_data <= fill_is_table ? {32'b0, fill_value} : {56'b0, fill_value[7:0]};
                             fill_wait_write <= 1'b1;
+                        end
+                    end
+                end
+
+                STATE_TABLE_INIT: begin
+                    // table.init copy loop: read from element segment, write to table
+                    // State machine: issue read -> wait for read -> issue write -> wait for write -> loop/done
+
+                    if (init_wait_write) begin
+                        // Waiting for write to complete
+                        if (mem_wr_valid) begin
+                            // Write completed, advance to next element
+                            init_src_addr <= init_src_addr + 32'd4;
+                            init_dst_addr <= init_dst_addr + 32'd4;
+                            init_count <= init_count - 32'd1;
+                            init_wait_write <= 1'b0;
+
+                            // Invalidate table cache for the written entry
+                            begin
+                                automatic logic [15:0] elem_idx = (init_dst_addr - table_base[init_table_idx]) >> 2;
+                                automatic logic [3:0] cache_idx = {init_table_idx, elem_idx[1:0]};
+                                if (table_cache[cache_idx].valid &&
+                                    table_cache[cache_idx].table_idx == init_table_idx &&
+                                    table_cache[cache_idx].elem_idx == elem_idx) begin
+                                    table_cache[cache_idx].valid <= 1'b0;
+                                end
+                            end
+                        end else if (mem_resp_i.error) begin
+                            trapped <= 1'b1;
+                            trap_code <= TRAP_OUT_OF_BOUNDS;
+                            state <= STATE_TRAP;
+                        end
+                    end else if (init_wait_read) begin
+                        // Waiting for read to complete
+                        if (mem_rd_valid) begin
+                            // Read completed, issue write to table
+                            init_read_data <= mem_rd_data[31:0];
+                            mem_wr_en <= 1'b1;
+                            mem_wr_addr <= init_dst_addr;
+                            mem_wr_op <= MEM_STORE_I32;
+                            mem_wr_data <= mem_rd_data;
+                            init_wait_read <= 1'b0;
+                            init_wait_write <= 1'b1;
+                        end else if (mem_resp_i.error) begin
+                            trapped <= 1'b1;
+                            trap_code <= TRAP_OUT_OF_BOUNDS;
+                            state <= STATE_TRAP;
+                        end
+                    end else begin
+                        // Not waiting - check if done or issue next read
+                        if (init_count == 0) begin
+                            state <= STATE_FETCH;
+                        end else begin
+                            // Issue read from element segment
+                            mem_rd_en <= 1'b1;
+                            mem_rd_addr <= init_src_addr;
+                            mem_rd_op <= MEM_LOAD_I32;
+                            init_wait_read <= 1'b1;
                         end
                     end
                 end

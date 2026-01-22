@@ -1059,11 +1059,9 @@ def main():
     SKIP_TESTS = {
         # WebAssembly 2.0 features (in scope, not yet implemented)
         'simd',           # SIMD not implemented (Phase 6)
-        'elem',           # Element segments - table.init, elem.drop (Phase 3)
         'memory_copy',    # memory.copy not yet implemented
         'memory_init',    # memory.init not yet implemented (requires data segments)
         'table_copy',     # table.copy not yet implemented
-        'table_init',     # table.init not yet implemented (requires element segments)
         'table-sub',      # Subtyping tests
         # WebAssembly 3.0 features (out of scope - defer to S-mode firmware)
         'multi-memory',   # v3 - defer to S-mode
