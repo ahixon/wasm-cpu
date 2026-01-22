@@ -1292,6 +1292,7 @@ module wasm_cpu
                                 import_arg2_q <= stack_peek_data2.value[31:0];  // TOS-2
                                 // Note: For 4th arg, would need additional peek port
                                 import_arg3_q <= 32'h0;
+                                pc <= saved_next_pc;  // Advance PC so resume continues after call
                                 state <= STATE_TRAP;
                             end else begin
                                 // Normal function call - copy arguments from stack to locals
