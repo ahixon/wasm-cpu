@@ -68,10 +68,11 @@ module wasm_memory
 
     // Bounds checking - must detect overflow in address+size
     function automatic logic in_bounds(input logic [31:0] addr, input int size);
-        logic [32:0] end_addr;  // 33-bit to detect overflow
+        logic [32:0] end_addr;
+        logic [32:0] mem_size;
         end_addr = {1'b0, addr} + size;
-        // Check for overflow (bit 32 set) or exceeds memory size
-        return !end_addr[32] && (end_addr[31:0] <= (num_pages * PAGE_SIZE));
+        mem_size = 33'(num_pages) * PAGE_SIZE;  // 33-bit to handle 4GB
+        return !end_addr[32] && (end_addr <= mem_size);
     endfunction
 
     // Get access size in bytes from mem_size_t

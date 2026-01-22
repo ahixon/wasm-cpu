@@ -564,7 +564,7 @@ package wasm_pkg;
     parameter int CALL_STACK_DEPTH = 256;   // Call stack depth
     parameter int LABEL_STACK_DEPTH = 256;  // Label/block stack depth
     parameter int LOCAL_COUNT = 256;        // Max locals per function
-    parameter int MEMORY_PAGES = 256;       // Max memory pages (64KB each)
+    parameter int MEMORY_PAGES = 65536;     // Max memory pages (64KB each) - WASM32 limit
     parameter int PAGE_SIZE = 65536;        // 64KB per page
     parameter int MAX_FUNCTIONS = 1024;     // Max functions in module
     parameter int MAX_GLOBALS = 256;        // Max globals

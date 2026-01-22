@@ -37,7 +37,7 @@ Implemented:
 - MVP integer operations (i32, i64)
 - MVP floating-point operations (f32, f64)
 - Saturating truncation operations
-- Linear memory (up to 256 pages / 16 MB)
+- Linear memory (configurable, up to WASM32 maximum of 4 GB)
 - Control flow (blocks, loops, branches, calls, call_indirect)
 - Local and global variables
 - Reference types (funcref, externref)

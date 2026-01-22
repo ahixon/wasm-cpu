@@ -58,11 +58,19 @@ module wasm_cpu_with_mem
     input  logic [7:0]  global_init_idx,
     input  global_entry_t global_init_data,
 
+    // Table metadata initialization interface
+    input  logic        table_init_en,
+    input  logic [1:0]  table_init_idx,
+    input  logic [15:0] table_init_size,
+    input  logic [15:0] table_init_max_size,
+    input  logic [3:0]  table_init_type,
+    input  logic [31:0] table_init_base,
+
     // Element table initialization interface
     input  logic        elem_init_en,
     input  logic [1:0]  elem_init_table_idx,
     input  logic [15:0] elem_init_idx,
-    input  logic [15:0] elem_init_func_idx,
+    input  logic [31:0] elem_init_value,
 
     // Type table initialization interface
     input  logic        type_init_en,
@@ -99,6 +107,10 @@ module wasm_cpu_with_mem
     output logic [31:0] import_arg1_o,
     output logic [31:0] import_arg2_o,
     output logic [31:0] import_arg3_o,
+
+    // Table grow trap information
+    output logic [1:0]  table_grow_table_idx_o,
+    output logic [31:0] table_grow_delta_o,
 
     // Debug memory read interface
     input  logic        dbg_mem_rd_en,
@@ -152,10 +164,16 @@ module wasm_cpu_with_mem
         .global_init_en(global_init_en),
         .global_init_idx(global_init_idx),
         .global_init_data(global_init_data),
+        .table_init_en(table_init_en),
+        .table_init_idx(table_init_idx),
+        .table_init_size(table_init_size),
+        .table_init_max_size(table_init_max_size),
+        .table_init_type(table_init_type),
+        .table_init_base(table_init_base),
         .elem_init_en(elem_init_en),
         .elem_init_table_idx(elem_init_table_idx),
         .elem_init_idx(elem_init_idx),
-        .elem_init_func_idx(elem_init_func_idx),
+        .elem_init_value(elem_init_value),
         .type_init_en(type_init_en),
         .type_init_idx(type_init_idx),
         .type_init_param_count(type_init_param_count),
@@ -182,6 +200,8 @@ module wasm_cpu_with_mem
         .import_arg1_o(import_arg1_o),
         .import_arg2_o(import_arg2_o),
         .import_arg3_o(import_arg3_o),
+        .table_grow_table_idx_o(table_grow_table_idx_o),
+        .table_grow_delta_o(table_grow_delta_o),
         .dbg_mem_rd_en(dbg_mem_rd_en),
         .dbg_mem_rd_addr(dbg_mem_rd_addr),
         .dbg_mem_rd_data(cpu_dbg_mem_rd_data),
