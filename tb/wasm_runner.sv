@@ -63,10 +63,10 @@ module wasm_runner;
     // Table base address configuration
     // Tables are stored in linear memory at these base addresses
     // Use addresses within the first 64KB page to avoid bounds issues
-    // Tables are placed at 56KB offset (0xE000), giving 2KB per table (512 entries max)
-    // This ensures all 4 tables fit within a single 64KB page
-    localparam logic [31:0] TB_TABLE_BASE = 32'h0000_E000;  // 56KB offset
-    localparam int TB_TABLE_STRIDE = 32'h0000_0800;         // 2KB per table (512 entries max)
+    // Tables are placed at 32KB offset (0x8000), giving 8KB per table (2048 entries max)
+    // This ensures all 4 tables fit within 32KB (0x8000-0xFFFF)
+    localparam logic [31:0] TB_TABLE_BASE = 32'h0000_8000;  // 32KB offset
+    localparam int TB_TABLE_STRIDE = 32'h0000_2000;         // 8KB per table (2048 entries max)
     logic type_init_en;
     logic [7:0] type_init_idx;
     logic [7:0] type_init_param_count;

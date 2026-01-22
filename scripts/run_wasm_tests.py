@@ -493,9 +493,6 @@ def run_module_tests(group: ModuleTestGroup, wasm_path: Path, verbose: bool = Fa
     # Check which functions use unsupported opcodes (v3/GC features)
     unsupported_funcs = get_functions_with_unsupported_opcodes(wasm_path)
 
-    # Hardware limit for tables (256 entries per table)
-    HARDWARE_TABLE_LIMIT = 256
-
     # Filter assertions to only include those with supported functions
     # Exception: tests expecting traps can still run (they'll trap anyway)
     supported_assertions = []
@@ -504,31 +501,6 @@ def run_module_tests(group: ModuleTestGroup, wasm_path: Path, verbose: bool = Fa
             skipped += 1
             if verbose:
                 print(f"SKIP: {wasm_path.name} func {assertion.func_idx} (uses call_ref, v3/GC feature)")
-        elif 'table_grow' in str(wasm_path):
-            # Check if table.grow would exceed hardware limit
-            # Skip tests where:
-            # 1. Grow amount > hardware limit
-            # 2. Expected old_size + grow > limit
-            skip_reason = None
-            for arg_type, arg_val in assertion.args:
-                if arg_type == 'i32' and isinstance(arg_val, int) and arg_val > HARDWARE_TABLE_LIMIT:
-                    skip_reason = f"table grow exceeds {HARDWARE_TABLE_LIMIT} entry hardware limit"
-                    break
-            # Also check if expected result (old_size) + any grow arg would exceed limit
-            if not skip_reason and assertion.expected:
-                for exp_type, exp_val in assertion.expected:
-                    if exp_type == 'i32' and isinstance(exp_val, int):
-                        for arg_type, arg_val in assertion.args:
-                            if arg_type == 'i32' and isinstance(arg_val, int):
-                                if exp_val + arg_val > HARDWARE_TABLE_LIMIT:
-                                    skip_reason = f"table grow exceeds {HARDWARE_TABLE_LIMIT} entry hardware limit"
-                                    break
-            if skip_reason:
-                skipped += 1
-                if verbose:
-                    print(f"SKIP: {wasm_path.name} ({skip_reason})")
-            else:
-                supported_assertions.append(assertion)
         else:
             supported_assertions.append(assertion)
 
