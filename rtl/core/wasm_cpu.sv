@@ -2395,6 +2395,13 @@ module wasm_cpu
                                     table_grow_delta <= tg_delta;
                                     table_grow_init_val <= tg_init_val;
 
+                                    // Set import fields for trap frame (S-mode firmware reads these)
+                                    import_id_q <= {14'b0, tg_which_tbl};  // table_idx
+                                    import_arg0_q <= tg_delta;              // delta
+                                    import_arg1_q <= {16'b0, table_metadata_size[tg_which_tbl]};  // current_size
+                                    import_arg2_q <= {16'b0, table_metadata_max_size[tg_which_tbl]}; // max_size
+                                    import_arg3_q <= tg_init_val;           // init_val for new entries
+
                                     // Pop delta and init_val (2 values)
                                     stack_multi_pop_en <= 1'b1;
                                     stack_multi_pop_count <= 8'd2;
