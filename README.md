@@ -44,11 +44,11 @@ Implemented:
 - Table operations (table.get, table.set, table.size, table.grow)
 - Reference instructions (ref.null, ref.is_null, ref.func, ref.as_non_null)
 - Reference branching (br_on_null, br_on_non_null)
+- Element segment operations (table.init, elem.drop)
 
 Not yet implemented (skipped in tests):
 - SIMD (128-bit vector operations)
 - Bulk memory operations (memory.init, memory.copy, memory.fill)
-- Element segment operations (table.init, elem.drop)
 - Typed function references (call_ref, return_call_ref)
 - Exception handling
 - Multiple memories (multi-memory proposal)
