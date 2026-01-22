@@ -118,7 +118,9 @@ module wasm_decoder
 
                     // Block type encoding:
                     // 0x40 = empty (void)
-                    // 0x7F = i32, 0x7E = i64, 0x7D = f32, 0x7C = f64, etc.
+                    // 0x7F = i32, 0x7E = i64, 0x7D = f32, 0x7C = f64
+                    // 0x70 = funcref, 0x6F = externref
+                    // 0x63 = ref null t, 0x64 = ref t (followed by heaptype)
                     // Otherwise it's a type index (s33 LEB128)
 
                     if (type_byte == 8'h40) begin
@@ -126,9 +128,23 @@ module wasm_decoder
                         decoded.immediate = 64'hFFFFFFFF;  // Marker for void
                         decoded.instr_length = 8'd2;
                     end else if (type_byte >= 8'h7C && type_byte <= 8'h7F) begin
-                        // Single value type
+                        // Single value type (i32/i64/f32/f64)
                         decoded.immediate = {56'b0, type_byte};
                         decoded.instr_length = 8'd2;
+                    end else if (type_byte == 8'h70 || type_byte == 8'h6F) begin
+                        // Reference type (funcref or externref)
+                        decoded.immediate = {56'b0, type_byte};
+                        decoded.instr_length = 8'd2;
+                    end else if (type_byte == 8'h63 || type_byte == 8'h64) begin
+                        // Typed reference: ref null t (0x63) or ref t (0x64)
+                        // Followed by heaptype LEB128
+                        logic [3:0] ht_len;
+                        logic [7:0] ht_bytes [0:9];
+                        for (int i = 0; i < 10; i++) begin
+                            ht_bytes[i] = instr_bytes[i+2];  // Start after type_byte
+                        end
+                        decoded.immediate = decode_sleb128(ht_bytes, 33, ht_len);
+                        decoded.instr_length = 8'd2 + {4'b0, ht_len};  // opcode + type_byte + heaptype
                     end else begin
                         // Type index (treat as unsigned for now)
                         decoded.immediate = decode_uleb128(leb_bytes, len);
@@ -225,6 +241,19 @@ module wasm_decoder
                     decoded.has_immediate = 1'b1;
                 end
 
+                // Table operations - table.get and table.set
+                // immediate = table index
+                8'h25, 8'h26: begin
+                    logic [3:0] len;
+                    logic [7:0] leb_bytes [0:9];
+                    for (int i = 0; i < 10; i++) begin
+                        leb_bytes[i] = instr_bytes[i+1];
+                    end
+                    decoded.immediate = decode_uleb128(leb_bytes, len);
+                    decoded.instr_length = 8'd1 + {4'b0, len};
+                    decoded.has_immediate = 1'b1;
+                end
+
                 // Memory instructions - have align and offset
                 8'h28, 8'h29, 8'h2A, 8'h2B, 8'h2C, 8'h2D, 8'h2E, 8'h2F,
                 8'h30, 8'h31, 8'h32, 8'h33, 8'h34, 8'h35,
@@ -301,7 +330,164 @@ module wasm_decoder
                 end
 
                 // Extended opcodes (0xFC prefix)
+                // Format: 0xFC <sub_opcode:LEB128> [immediates...]
+                // immediate = sub-opcode, immediate2 = first operand (if any)
                 8'hFC: begin
+                    logic [3:0] len1, len2, len3;
+                    logic [7:0] leb_bytes [0:9];
+                    logic [63:0] sub_opcode;
+
+                    // Decode sub-opcode (LEB128 encoded)
+                    for (int i = 0; i < 10; i++) begin
+                        leb_bytes[i] = instr_bytes[i+1];
+                    end
+                    sub_opcode = decode_uleb128(leb_bytes, len1);
+                    decoded.immediate = sub_opcode;
+                    decoded.has_immediate = 1'b1;
+
+                    case (sub_opcode[7:0])
+                        // Saturating truncation (no additional immediates)
+                        8'h00, 8'h01, 8'h02, 8'h03,
+                        8'h04, 8'h05, 8'h06, 8'h07: begin
+                            decoded.instr_length = 8'd1 + {4'b0, len1};
+                        end
+
+                        // memory.init - data_idx + mem_idx (usually 0)
+                        8'h08: begin
+                            for (int i = 0; i < 10; i++) begin
+                                leb_bytes[i] = instr_bytes[i+1+len1];
+                            end
+                            decoded.immediate2 = decode_uleb128(leb_bytes, len2);  // data_idx
+                            // Skip mem_idx (always 0 for now)
+                            decoded.instr_length = 8'd1 + {4'b0, len1} + {4'b0, len2} + 8'd1;
+                            decoded.has_immediate2 = 1'b1;
+                        end
+
+                        // data.drop - data_idx
+                        8'h09: begin
+                            for (int i = 0; i < 10; i++) begin
+                                leb_bytes[i] = instr_bytes[i+1+len1];
+                            end
+                            decoded.immediate2 = decode_uleb128(leb_bytes, len2);
+                            decoded.instr_length = 8'd1 + {4'b0, len1} + {4'b0, len2};
+                            decoded.has_immediate2 = 1'b1;
+                        end
+
+                        // memory.copy - dst_mem + src_mem (both usually 0)
+                        8'h0A: begin
+                            decoded.instr_length = 8'd1 + {4'b0, len1} + 8'd2;  // +2 for two 0x00 bytes
+                        end
+
+                        // memory.fill - mem_idx (usually 0)
+                        8'h0B: begin
+                            decoded.instr_length = 8'd1 + {4'b0, len1} + 8'd1;  // +1 for 0x00
+                        end
+
+                        // table.init - elem_idx + table_idx
+                        8'h0C: begin
+                            for (int i = 0; i < 10; i++) begin
+                                leb_bytes[i] = instr_bytes[i+1+len1];
+                            end
+                            decoded.immediate2 = decode_uleb128(leb_bytes, len2);  // elem_idx
+                            for (int i = 0; i < 10; i++) begin
+                                leb_bytes[i] = instr_bytes[i+1+len1+len2];
+                            end
+                            void'(decode_uleb128(leb_bytes, len3));  // table_idx (stored in bits after elem_idx)
+                            decoded.instr_length = 8'd1 + {4'b0, len1} + {4'b0, len2} + {4'b0, len3};
+                            decoded.has_immediate2 = 1'b1;
+                        end
+
+                        // elem.drop - elem_idx
+                        8'h0D: begin
+                            for (int i = 0; i < 10; i++) begin
+                                leb_bytes[i] = instr_bytes[i+1+len1];
+                            end
+                            decoded.immediate2 = decode_uleb128(leb_bytes, len2);
+                            decoded.instr_length = 8'd1 + {4'b0, len1} + {4'b0, len2};
+                            decoded.has_immediate2 = 1'b1;
+                        end
+
+                        // table.copy - dst_table_idx + src_table_idx
+                        8'h0E: begin
+                            for (int i = 0; i < 10; i++) begin
+                                leb_bytes[i] = instr_bytes[i+1+len1];
+                            end
+                            decoded.immediate2 = decode_uleb128(leb_bytes, len2);  // dst_table
+                            for (int i = 0; i < 10; i++) begin
+                                leb_bytes[i] = instr_bytes[i+1+len1+len2];
+                            end
+                            void'(decode_uleb128(leb_bytes, len3));  // src_table (not stored separately)
+                            decoded.instr_length = 8'd1 + {4'b0, len1} + {4'b0, len2} + {4'b0, len3};
+                            decoded.has_immediate2 = 1'b1;
+                        end
+
+                        // table.grow, table.size, table.fill - table_idx
+                        8'h0F, 8'h10, 8'h11: begin
+                            for (int i = 0; i < 10; i++) begin
+                                leb_bytes[i] = instr_bytes[i+1+len1];
+                            end
+                            decoded.immediate2 = decode_uleb128(leb_bytes, len2);
+                            decoded.instr_length = 8'd1 + {4'b0, len1} + {4'b0, len2};
+                            decoded.has_immediate2 = 1'b1;
+                        end
+
+                        default: begin
+                            // Unknown extended opcode
+                            decoded.instr_length = 8'd1 + {4'b0, len1};
+                        end
+                    endcase
+                end
+
+                // Reference type instructions (0xD0 - 0xD6)
+                // ref.null t - push null reference of type t
+                // immediate = heap type (0x70 = funcref, 0x6F = externref)
+                8'hD0: begin
+                    logic [3:0] len;
+                    logic [7:0] leb_bytes [0:9];
+                    for (int i = 0; i < 10; i++) begin
+                        leb_bytes[i] = instr_bytes[i+1];
+                    end
+                    decoded.immediate = decode_sleb128(leb_bytes, 33, len);
+                    decoded.instr_length = 8'd1 + {4'b0, len};
+                    decoded.has_immediate = 1'b1;
+                end
+
+                // ref.is_null - check if reference is null
+                8'hD1: begin
+                    decoded.instr_length = 8'd1;
+                end
+
+                // ref.func $funcidx - create funcref from function index
+                8'hD2: begin
+                    logic [3:0] len;
+                    logic [7:0] leb_bytes [0:9];
+                    for (int i = 0; i < 10; i++) begin
+                        leb_bytes[i] = instr_bytes[i+1];
+                    end
+                    decoded.immediate = decode_uleb128(leb_bytes, len);
+                    decoded.instr_length = 8'd1 + {4'b0, len};
+                    decoded.has_immediate = 1'b1;
+                end
+
+                // ref.as_non_null - assert reference is not null
+                8'hD3: begin
+                    decoded.instr_length = 8'd1;
+                end
+
+                // br_on_null $l - branch if reference is null
+                8'hD5: begin
+                    logic [3:0] len;
+                    logic [7:0] leb_bytes [0:9];
+                    for (int i = 0; i < 10; i++) begin
+                        leb_bytes[i] = instr_bytes[i+1];
+                    end
+                    decoded.immediate = decode_uleb128(leb_bytes, len);
+                    decoded.instr_length = 8'd1 + {4'b0, len};
+                    decoded.has_immediate = 1'b1;
+                end
+
+                // br_on_non_null $l - branch if reference is not null
+                8'hD6: begin
                     logic [3:0] len;
                     logic [7:0] leb_bytes [0:9];
                     for (int i = 0; i < 10; i++) begin

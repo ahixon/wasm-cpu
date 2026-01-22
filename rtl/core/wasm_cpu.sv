@@ -56,11 +56,21 @@ module wasm_cpu
     input  logic [7:0]  global_init_idx,
     input  global_entry_t global_init_data,
 
-    // Element table initialization interface (for call_indirect)
+    // Table metadata initialization (size, type, and base address)
+    input  logic        table_init_en,
+    input  logic [1:0]  table_init_idx,
+    input  logic [15:0] table_init_size,
+    input  logic [15:0] table_init_max_size,  // 0 = no limit
+    input  logic [3:0]  table_init_type,      // valtype_t: TYPE_FUNCREF or TYPE_EXTERNREF
+    input  logic [31:0] table_init_base,      // Base address in linear memory
+
+    // Element table initialization interface (for call_indirect and table operations)
+    // NOTE: Elements are now written directly to memory by the testbench; this interface
+    // is kept for backward compatibility but elem_init writes go through memory interface
     input  logic        elem_init_en,
     input  logic [1:0]  elem_init_table_idx,  // Which table (0-3)
     input  logic [15:0] elem_init_idx,
-    input  logic [15:0] elem_init_func_idx,  // Function index stored in table
+    input  logic [31:0] elem_init_value,      // Reference value (funcref/externref)
 
     // Type table initialization interface (for multi-value block types)
     input  logic        type_init_en,
@@ -98,6 +108,10 @@ module wasm_cpu
     output logic [31:0] import_arg2_o,            // Import argument 2
     output logic [31:0] import_arg3_o,            // Import argument 3
 
+    // Table grow trap information (valid when trap_code == TRAP_TABLE_GROW)
+    output logic [1:0]  table_grow_table_idx_o,   // Which table to grow (0-3)
+    output logic [31:0] table_grow_delta_o,       // Number of elements to add
+
     // Debug memory read interface (directly to memory, active when halted)
     input  logic        dbg_mem_rd_en,
     input  logic [31:0] dbg_mem_rd_addr,
@@ -114,6 +128,10 @@ module wasm_cpu
     // WASM-specific memory operation info (for sign extension in memory adapter)
     output mem_op_t     mem_op_o,         // Original WASM memory operation
     input  trap_t       mem_trap_i        // Memory trap (out of bounds, etc.)
+
+    // NOTE: Table storage is now memory-backed with internal caching
+    // Table entries are stored in linear memory at addresses controlled by table_base registers
+    // External table_req_o/table_resp_i ports have been removed
 );
 
     // =========================================================================
@@ -235,14 +253,33 @@ module wasm_cpu
     } type_entry_t;
     type_entry_t type_table [0:255];  // Support up to 256 types
 
-    // Element tables (for call_indirect) - stores function indices
-    // Entry is 16-bit func index, with 0xFFFF meaning uninitialized
-    // Support up to 4 tables with 256 entries each
-    logic [15:0] elem_table_0 [0:255];
-    logic [15:0] elem_table_1 [0:255];
-    logic [15:0] elem_table_2 [0:255];
-    logic [15:0] elem_table_3 [0:255];
-    logic [15:0] elem_table_size [0:3];  // Size of each table
+    // =========================================================================
+    // Table Storage (memory-backed with cache)
+    // =========================================================================
+    // Table entries are stored in linear memory at addresses controlled by table_base registers
+    // A small direct-mapped cache provides single-cycle hits for call_indirect
+
+    // Table metadata registers (4 tables supported)
+    logic [31:0] table_base [0:3];              // Base address per table (set by init/S-mode)
+    logic [15:0] table_metadata_size [0:3];     // Current size (writable by S-mode)
+    logic [15:0] table_metadata_max_size [0:3]; // Max size limit
+    logic [3:0]  table_metadata_type [0:3];     // Element type per table
+
+    // Table cache - 16-entry direct-mapped (4 entries per table)
+    // Index by {table_idx[1:0], elem_idx[1:0]}
+    table_cache_entry_t table_cache [0:TABLE_CACHE_SIZE-1];
+
+    // Cache miss context (saved when going to STATE_TABLE_CACHE_MISS)
+    logic [1:0]  table_miss_table_idx;
+    logic [15:0] table_miss_elem_idx;
+    logic        table_miss_is_call_indirect;
+    logic        table_miss_is_table_set;  // For write-through on cache miss
+    logic [31:0] table_miss_write_data;    // Data to write (for table.set)
+
+    // table.grow trap info (saved for S-mode handler)
+    logic [1:0]  table_grow_table_idx;
+    logic [31:0] table_grow_delta;
+    logic [31:0] table_grow_init_val;
 
     // =========================================================================
     // Operand Stack
@@ -695,34 +732,39 @@ module wasm_cpu
     end
 
     // =========================================================================
-    // Element Table Interface (for call_indirect)
+    // Table Metadata and Cache Initialization
     // =========================================================================
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            // Initialize all table sizes to 0
+            // Initialize all table metadata to defaults
             for (int t = 0; t < 4; t++) begin
-                elem_table_size[t] = 16'h0;
+                table_base[t] <= 32'h0;
+                table_metadata_size[t] <= 16'h0;
+                table_metadata_max_size[t] <= 16'h0;
+                table_metadata_type[t] <= TYPE_FUNCREF;
             end
-            // Initialize all entries to 0xFFFF (uninitialized marker)
-            for (int i = 0; i < 256; i++) begin
-                elem_table_0[i] = 16'hFFFF;
-                elem_table_1[i] = 16'hFFFF;
-                elem_table_2[i] = 16'hFFFF;
-                elem_table_3[i] = 16'hFFFF;
+            // Initialize cache entries as invalid
+            for (int c = 0; c < TABLE_CACHE_SIZE; c++) begin
+                table_cache[c].valid <= 1'b0;
+                table_cache[c].table_idx <= 2'b0;
+                table_cache[c].elem_idx <= 16'h0;
+                table_cache[c].data <= 32'h0;
             end
-        end else if (elem_init_en) begin
-            // Write to the appropriate table based on table index
-            case (elem_init_table_idx)
-                2'd0: elem_table_0[elem_init_idx[7:0]] <= elem_init_func_idx;
-                2'd1: elem_table_1[elem_init_idx[7:0]] <= elem_init_func_idx;
-                2'd2: elem_table_2[elem_init_idx[7:0]] <= elem_init_func_idx;
-                2'd3: elem_table_3[elem_init_idx[7:0]] <= elem_init_func_idx;
-            endcase
-            // Track the highest index + 1 as size for this table
-            if (elem_init_idx >= elem_table_size[elem_init_table_idx]) begin
-                elem_table_size[elem_init_table_idx] <= elem_init_idx + 16'h1;
+        end else if (table_init_en) begin
+            // Initialize table metadata from external interface
+            table_base[table_init_idx] <= table_init_base;
+            table_metadata_size[table_init_idx] <= table_init_size;
+            table_metadata_max_size[table_init_idx] <= table_init_max_size;
+            table_metadata_type[table_init_idx] <= table_init_type;
+            // Invalidate cache entries for this table on reinitialization
+            for (int c = 0; c < TABLE_CACHE_SIZE; c++) begin
+                if (table_cache[c].table_idx == table_init_idx) begin
+                    table_cache[c].valid <= 1'b0;
+                end
             end
         end
+        // Note: elem_init_en now writes directly to memory via testbench
+        // Cache updates happen during STATE_TABLE_CACHE_MISS or table.set
     end
 
     // =========================================================================
@@ -809,6 +851,16 @@ module wasm_cpu
             import_arg1_q <= 32'h0;
             import_arg2_q <= 32'h0;
             import_arg3_q <= 32'h0;
+            // Table cache miss context
+            table_miss_table_idx <= 2'b0;
+            table_miss_elem_idx <= 16'h0;
+            table_miss_is_call_indirect <= 1'b0;
+            table_miss_is_table_set <= 1'b0;
+            table_miss_write_data <= 32'h0;
+            // table.grow trap info
+            table_grow_table_idx <= 2'b0;
+            table_grow_delta <= 32'h0;
+            table_grow_init_val <= 32'h0;
         end else begin
             // Default assignments
             stack_push_en <= 1'b0;
@@ -1029,6 +1081,102 @@ module wasm_cpu
                             end
                         end
 
+                        OP_BR_ON_NULL: begin
+                            // Branch if reference is null, drop reference; else leave on stack
+                            // Stack: [..., ref] -> [...] if null (and branch)
+                            //                   -> [..., ref] if not null (no branch)
+                            logic [7:0] bron_func_label_count;
+                            logic bron_is_func_return;
+                            bron_func_label_count = label_stack_ptr - current_frame.label_height;
+                            bron_is_func_return = (saved_decoded.immediate[7:0] >= bron_func_label_count);
+
+                            if (operand_a.value[31:0] == REF_NULL_VALUE) begin
+                                // Reference is null - pop and take branch
+                                stack_pop_en <= 1'b1;
+                                if (bron_is_func_return) begin
+                                    label_set_sp_en <= 1'b1;
+                                    label_set_sp_value <= current_frame.label_height;
+                                    branch_target_stack_height <= current_frame.stack_height;
+                                    branch_target_arity <= current_frame.arity;
+                                    branch_target_pc <= 32'hFFFFFFFF;
+                                    branch_saved_value <= operand_b;
+                                    branch_pop_pending <= 1'b1;
+                                    state <= STATE_BR_UNWIND;
+                                end else begin
+                                    branch_target_stack_height <= label_branch_target.stack_height;
+                                    branch_target_arity <= label_branch_target.arity;
+                                    branch_target_pc <= label_branch_target.target_pc;
+                                    if (label_branch_target.is_loop) begin
+                                        if (saved_decoded.immediate[7:0] > 0) begin
+                                            label_set_sp_en <= 1'b1;
+                                            label_set_sp_value <= label_stack_ptr - saved_decoded.immediate[7:0];
+                                        end
+                                        pc <= label_branch_target.target_pc;
+                                        state <= STATE_FETCH;
+                                    end else begin
+                                        label_branch_pop_en <= 1'b1;
+                                        scan_depth <= saved_decoded.immediate[7:0];
+                                        scan_for_else <= 1'b0;
+                                        scan_needs_unwind <= 1'b1;
+                                        pc <= saved_next_pc;
+                                        state <= STATE_SCAN_END;
+                                    end
+                                end
+                            end else begin
+                                // Reference is not null - don't pop, don't branch
+                                pc <= saved_next_pc;
+                                state <= STATE_FETCH;
+                            end
+                        end
+
+                        OP_BR_ON_NON_NULL: begin
+                            // Branch if reference is not null, passing reference; else drop
+                            // Stack: [..., ref] -> [..., ref] if not null (and branch with ref)
+                            //                   -> [...] if null (no branch, drop ref)
+                            logic [7:0] bronn_func_label_count;
+                            logic bronn_is_func_return;
+                            bronn_func_label_count = label_stack_ptr - current_frame.label_height;
+                            bronn_is_func_return = (saved_decoded.immediate[7:0] >= bronn_func_label_count);
+
+                            if (operand_a.value[31:0] != REF_NULL_VALUE) begin
+                                // Reference is not null - take branch with reference on stack
+                                if (bronn_is_func_return) begin
+                                    label_set_sp_en <= 1'b1;
+                                    label_set_sp_value <= current_frame.label_height;
+                                    branch_target_stack_height <= current_frame.stack_height;
+                                    branch_target_arity <= current_frame.arity;
+                                    branch_target_pc <= 32'hFFFFFFFF;
+                                    branch_saved_value <= operand_a;  // Save the reference
+                                    branch_pop_pending <= 1'b0;  // No pop pending
+                                    state <= STATE_BR_UNWIND;
+                                end else begin
+                                    branch_target_stack_height <= label_branch_target.stack_height;
+                                    branch_target_arity <= label_branch_target.arity;
+                                    branch_target_pc <= label_branch_target.target_pc;
+                                    if (label_branch_target.is_loop) begin
+                                        if (saved_decoded.immediate[7:0] > 0) begin
+                                            label_set_sp_en <= 1'b1;
+                                            label_set_sp_value <= label_stack_ptr - saved_decoded.immediate[7:0];
+                                        end
+                                        pc <= label_branch_target.target_pc;
+                                        state <= STATE_FETCH;
+                                    end else begin
+                                        label_branch_pop_en <= 1'b1;
+                                        scan_depth <= saved_decoded.immediate[7:0];
+                                        scan_for_else <= 1'b0;
+                                        scan_needs_unwind <= 1'b1;
+                                        pc <= saved_next_pc;
+                                        state <= STATE_SCAN_END;
+                                    end
+                                end
+                            end else begin
+                                // Reference is null - pop and don't branch
+                                stack_pop_en <= 1'b1;
+                                pc <= saved_next_pc;
+                                state <= STATE_FETCH;
+                            end
+                        end
+
                         OP_BR_IF: begin
                             stack_pop_en <= 1'b1;
                             if (operand_a.value[31:0] != 32'h0) begin
@@ -1151,45 +1299,42 @@ module wasm_cpu
                             // Indirect call - operand_a (TOS) is the element index within the table
                             // saved_decoded.immediate = type_index (expected type)
                             // saved_decoded.immediate2 = table_index (which table, 0-3)
+                            // Uses memory-backed tables with internal caching
                             logic [31:0] elem_idx;
+                            logic [31:0] table_entry;
                             logic [15:0] target_func_idx;
                             logic [1:0] which_table;
                             logic [15:0] table_size;
+                            logic [3:0] cache_idx;
+                            logic cache_hit;
 
                             elem_idx = operand_a.value[31:0];
                             which_table = saved_decoded.immediate2[1:0];
+                            table_size = table_metadata_size[which_table];
 
-                            // Get the size of the selected table
-                            case (which_table)
-                                2'd0: table_size = elem_table_size[0];
-                                2'd1: table_size = elem_table_size[1];
-                                2'd2: table_size = elem_table_size[2];
-                                2'd3: table_size = elem_table_size[3];
-                            endcase
+                            // Check cache - index by {table_idx[1:0], elem_idx[1:0]}
+                            cache_idx = {which_table, elem_idx[1:0]};
+                            cache_hit = table_cache[cache_idx].valid &&
+                                        table_cache[cache_idx].table_idx == which_table &&
+                                        table_cache[cache_idx].elem_idx == elem_idx[15:0];
 
                             // Check if element index is out of bounds
                             if (elem_idx >= {16'b0, table_size}) begin
                                 trapped <= 1'b1;
                                 trap_code <= TRAP_UNDEFINED_ELEMENT;
                                 state <= STATE_TRAP;
-                            end else begin
-                                // Get function index from the selected table
-                                case (which_table)
-                                    2'd0: target_func_idx = elem_table_0[elem_idx[7:0]];
-                                    2'd1: target_func_idx = elem_table_1[elem_idx[7:0]];
-                                    2'd2: target_func_idx = elem_table_2[elem_idx[7:0]];
-                                    2'd3: target_func_idx = elem_table_3[elem_idx[7:0]];
-                                endcase
+                            end else if (cache_hit) begin
+                                // CACHE HIT - single cycle path
+                                table_entry = table_cache[cache_idx].data;
+                                target_func_idx = table_entry[15:0];
 
-                                // Check if element is uninitialized
-                                if (target_func_idx == 16'hFFFF) begin
+                                // Check if element is null (REF_NULL_VALUE)
+                                if (table_entry == REF_NULL_VALUE) begin
                                     trapped <= 1'b1;
                                     trap_code <= TRAP_UNINITIALIZED_ELEMENT;
                                     state <= STATE_TRAP;
                                 end else begin
-                                    // Structural type check: compare full type signatures
-                                    // Expected type from call_indirect instruction
-                                    // Actual type from the target function's type_idx
+                                    // Structural type check
                                     automatic type_entry_t expected_type = type_table[saved_decoded.immediate[7:0]];
                                     automatic type_entry_t actual_type = type_table[func_table[target_func_idx].type_idx[7:0]];
 
@@ -1197,7 +1342,6 @@ module wasm_cpu
                                         expected_type.result_count != actual_type.result_count ||
                                         expected_type.param_types != actual_type.param_types ||
                                         expected_type.result_types != actual_type.result_types) begin
-                                        // Type mismatch
                                         trapped <= 1'b1;
                                         trap_code <= TRAP_INDIRECT_CALL_TYPE_MISMATCH;
                                         state <= STATE_TRAP;
@@ -1205,12 +1349,10 @@ module wasm_cpu
                                         // Pop the element index from stack
                                         stack_pop_en <= 1'b1;
 
-                                        // Set up the call like OP_CALL does
+                                        // Set up the call
                                         call_func_idx <= target_func_idx;
                                         call_param_count <= func_table[target_func_idx].param_count;
                                         call_arg_idx <= 8'd0;
-                                        // Add +1 to initial peek offset because the element index pop
-                                        // won't take effect until the next cycle (same cycle as first STATE_CALL)
                                         call_peek_offset <= {8'b0, func_table[target_func_idx].param_count};
                                         call_new_local_base <= current_frame.local_base +
                                                                func_table[current_frame.func_idx].param_count +
@@ -1218,6 +1360,23 @@ module wasm_cpu
                                         state <= STATE_CALL;
                                     end
                                 end
+                            end else begin
+                                // CACHE MISS - fetch from memory
+                                // Pop the element index first (we'll complete the call after fetch)
+                                stack_pop_en <= 1'b1;
+
+                                // Issue memory read for table entry
+                                mem_rd_en <= 1'b1;
+                                mem_rd_addr <= table_base[which_table] + {elem_idx[29:0], 2'b00};  // base + idx*4
+                                mem_rd_op <= MEM_LOAD_I32;
+
+                                // Save context for STATE_TABLE_CACHE_MISS
+                                table_miss_table_idx <= which_table;
+                                table_miss_elem_idx <= elem_idx[15:0];
+                                table_miss_is_call_indirect <= 1'b1;
+                                table_miss_is_table_set <= 1'b0;
+
+                                state <= STATE_TABLE_CACHE_MISS;
                             end
                         end
 
@@ -1250,6 +1409,50 @@ module wasm_cpu
                             end
 
                             state <= STATE_WRITEBACK;
+                        end
+
+                        // ==== Reference Type Instructions ====
+                        OP_REF_NULL: begin
+                            // Push null reference of the specified type
+                            // immediate contains the heap type: 0x70 (funcref) or 0x6F (externref)
+                            // Negative values in s33 encoding: 0x70 = -16 = funcref, 0x6F = -17 = externref
+                            exec_result <= {32'b0, REF_NULL_VALUE};  // Null reference value
+                            if (saved_decoded.immediate[7:0] == 8'h70 ||
+                                saved_decoded.immediate == 64'hFFFFFFFFFFFFFFF0) begin  // funcref (-16 signed)
+                                exec_result_type <= TYPE_FUNCREF;
+                            end else begin
+                                exec_result_type <= TYPE_EXTERNREF;
+                            end
+                            state <= STATE_WRITEBACK;
+                        end
+
+                        OP_REF_IS_NULL: begin
+                            // Check if reference is null, push i32 result
+                            stack_pop_en <= 1'b1;
+                            exec_result <= (operand_a.value[31:0] == REF_NULL_VALUE) ? 64'h1 : 64'h0;
+                            exec_result_type <= TYPE_I32;
+                            state <= STATE_WRITEBACK;
+                        end
+
+                        OP_REF_FUNC: begin
+                            // Create funcref from function index
+                            // immediate = function index
+                            exec_result <= {32'b0, saved_decoded.immediate[31:0]};
+                            exec_result_type <= TYPE_FUNCREF;
+                            state <= STATE_WRITEBACK;
+                        end
+
+                        OP_REF_AS_NON_NULL: begin
+                            // Assert reference is not null, trap if it is
+                            // Stack: [(ref null t)] -> [(ref t)] or trap
+                            if (operand_a.value[31:0] == REF_NULL_VALUE) begin
+                                trap_code <= TRAP_NULL_REFERENCE;
+                                state <= STATE_TRAP;
+                            end else begin
+                                // Reference is not null - leave it on stack
+                                pc <= saved_next_pc;
+                                state <= STATE_FETCH;
+                            end
                         end
 
                         // ==== Variable Instructions ====
@@ -1293,6 +1496,111 @@ module wasm_cpu
                             global_wr_data <= operand_a;
                             pc <= saved_next_pc;
                             state <= STATE_FETCH;
+                        end
+
+                        // ==== Table Instructions ====
+                        OP_TABLE_GET: begin
+                            // table.get: pop index, push table[index]
+                            // immediate = table index
+                            // Uses memory-backed tables with internal caching
+                            logic [31:0] tbl_idx;
+                            logic [31:0] tbl_entry;
+                            logic [1:0] which_tbl;
+                            logic [15:0] tbl_size;
+                            logic [3:0] cache_idx;
+                            logic cache_hit;
+
+                            tbl_idx = operand_a.value[31:0];
+                            which_tbl = saved_decoded.immediate[1:0];
+                            tbl_size = table_metadata_size[which_tbl];
+
+                            // Check cache
+                            cache_idx = {which_tbl, tbl_idx[1:0]};
+                            cache_hit = table_cache[cache_idx].valid &&
+                                        table_cache[cache_idx].table_idx == which_tbl &&
+                                        table_cache[cache_idx].elem_idx == tbl_idx[15:0];
+
+                            // Bounds check
+                            if (tbl_idx >= {16'b0, tbl_size}) begin
+                                trapped <= 1'b1;
+                                trap_code <= TRAP_OUT_OF_BOUNDS;
+                                state <= STATE_TRAP;
+                            end else if (cache_hit) begin
+                                // CACHE HIT - single cycle
+                                tbl_entry = table_cache[cache_idx].data;
+
+                                // Pop index, push reference value
+                                stack_pop_en <= 1'b1;
+                                stack_push_en <= 1'b1;
+                                stack_push_data.vtype <= valtype_t'(table_metadata_type[which_tbl]);
+                                stack_push_data.value <= {32'b0, tbl_entry};
+                                pc <= saved_next_pc;
+                                state <= STATE_FETCH;
+                            end else begin
+                                // CACHE MISS - fetch from memory
+                                stack_pop_en <= 1'b1;
+
+                                // Issue memory read for table entry
+                                mem_rd_en <= 1'b1;
+                                mem_rd_addr <= table_base[which_tbl] + {tbl_idx[29:0], 2'b00};  // base + idx*4
+                                mem_rd_op <= MEM_LOAD_I32;
+
+                                // Save context for STATE_TABLE_CACHE_MISS
+                                table_miss_table_idx <= which_tbl;
+                                table_miss_elem_idx <= tbl_idx[15:0];
+                                table_miss_is_call_indirect <= 1'b0;
+                                table_miss_is_table_set <= 1'b0;
+
+                                state <= STATE_TABLE_CACHE_MISS;
+                            end
+                        end
+
+                        OP_TABLE_SET: begin
+                            // table.set: pop value and index, set table[index] = value
+                            // immediate = table index
+                            // operand_a (TOS) = value, operand_b (TOS-1) = index
+                            // Write-through: update cache if present, always write to memory
+                            logic [31:0] tbl_idx;
+                            logic [31:0] tbl_value;
+                            logic [1:0] which_tbl;
+                            logic [15:0] tbl_size;
+                            logic [3:0] cache_idx;
+                            logic cache_hit;
+
+                            tbl_value = operand_a.value[31:0];
+                            tbl_idx = operand_b.value[31:0];
+                            which_tbl = saved_decoded.immediate[1:0];
+                            tbl_size = table_metadata_size[which_tbl];
+
+                            // Check cache
+                            cache_idx = {which_tbl, tbl_idx[1:0]};
+                            cache_hit = table_cache[cache_idx].valid &&
+                                        table_cache[cache_idx].table_idx == which_tbl &&
+                                        table_cache[cache_idx].elem_idx == tbl_idx[15:0];
+
+                            // Bounds check
+                            if (tbl_idx >= {16'b0, tbl_size}) begin
+                                trapped <= 1'b1;
+                                trap_code <= TRAP_OUT_OF_BOUNDS;
+                                state <= STATE_TRAP;
+                            end else begin
+                                // Pop both values
+                                stack_multi_pop_en <= 1'b1;
+                                stack_multi_pop_count <= 8'd2;
+
+                                // Update cache if hit (write-through)
+                                if (cache_hit) begin
+                                    table_cache[cache_idx].data <= tbl_value;
+                                end
+
+                                // Write to memory
+                                mem_wr_en <= 1'b1;
+                                mem_wr_addr <= table_base[which_tbl] + {tbl_idx[29:0], 2'b00};  // base + idx*4
+                                mem_wr_data <= {32'b0, tbl_value};
+                                mem_wr_op <= MEM_STORE_I32;
+
+                                state <= STATE_MEMORY;
+                            end
                         end
 
                         // ==== Memory Instructions ====
@@ -1704,6 +2012,7 @@ module wasm_cpu
                                 import_arg2_q <= mem_init_max_pages;      // Max pages (from init)
                                 import_arg3_q <= 32'h0;
                                 stack_pop_en <= 1'b1;  // Pop the requested pages argument
+                                pc <= saved_next_pc;   // Advance PC so resume continues after memory.grow
                                 state <= STATE_TRAP;
                             end else begin
                                 // Standalone: handle locally
@@ -2054,22 +2363,89 @@ module wasm_cpu
                             state <= STATE_WRITEBACK;
                         end
 
-                        // Extended opcodes (0xFC prefix) - trunc_sat
+                        // Extended opcodes (0xFC prefix)
                         OP_PREFIX_FC: begin
                             // immediate[7:0] contains the sub-opcode
-                            // 0x00-0x07 are trunc_sat operations
-                            if (saved_decoded.immediate[7:0] <= 8'd7) begin
-                                stack_pop_en <= 1'b1;
-                                conv_valid_in <= 1'b1;
-                                conv_op <= OP_PREFIX_FC;
-                                conv_sub_op <= saved_decoded.immediate[7:0];
-                                conv_operand <= operand_a.value;
-                                state <= STATE_WRITEBACK;
-                            end else begin
-                                // Other 0xFC opcodes not implemented
-                                pc <= saved_next_pc;
-                                state <= STATE_FETCH;
-                            end
+                            case (saved_decoded.immediate[7:0])
+                                // 0x00-0x07: trunc_sat operations
+                                8'h00, 8'h01, 8'h02, 8'h03,
+                                8'h04, 8'h05, 8'h06, 8'h07: begin
+                                    stack_pop_en <= 1'b1;
+                                    conv_valid_in <= 1'b1;
+                                    conv_op <= OP_PREFIX_FC;
+                                    conv_sub_op <= saved_decoded.immediate[7:0];
+                                    conv_operand <= operand_a.value;
+                                    state <= STATE_WRITEBACK;
+                                end
+
+                                // 0x0F: table.grow - immediate2 = table_idx
+                                // Stack: [init_val, delta] -> [old_size or -1]
+                                // Traps to S-mode for approval (memory allocation)
+                                FC_TABLE_GROW: begin
+                                    logic [1:0] tg_which_tbl;
+                                    logic [31:0] tg_delta;
+                                    logic [31:0] tg_init_val;
+
+                                    tg_which_tbl = saved_decoded.immediate2[1:0];
+                                    tg_delta = operand_a.value[31:0];     // TOS = delta
+                                    tg_init_val = operand_b.value[31:0]; // TOS-1 = init_val
+
+                                    // Save grow request info for S-mode handler
+                                    table_grow_table_idx <= tg_which_tbl;
+                                    table_grow_delta <= tg_delta;
+                                    table_grow_init_val <= tg_init_val;
+
+                                    // Pop delta and init_val (2 values)
+                                    stack_multi_pop_en <= 1'b1;
+                                    stack_multi_pop_count <= 8'd2;
+
+                                    // Trap to S-mode for approval
+                                    trapped <= 1'b1;
+                                    trap_code <= TRAP_TABLE_GROW;
+                                    pc <= saved_next_pc;  // Advance PC so resume continues after table.grow
+                                    state <= STATE_TRAP;
+                                end
+
+                                // 0x10: table.size - immediate2 = table_idx
+                                // Stack: [] -> [size]
+                                // Single-cycle register read from internal metadata
+                                FC_TABLE_SIZE: begin
+                                    logic [1:0] ts_which_tbl;
+
+                                    ts_which_tbl = saved_decoded.immediate2[1:0];
+
+                                    // Push size from internal metadata register
+                                    stack_push_en <= 1'b1;
+                                    stack_push_data.vtype <= TYPE_I32;
+                                    stack_push_data.value <= {48'b0, table_metadata_size[ts_which_tbl]};
+                                    pc <= saved_next_pc;
+                                    state <= STATE_FETCH;
+                                end
+
+                                // 0x11: table.fill - immediate2 = table_idx
+                                // Stack: [dest, val, count] -> []
+                                // For now, trap (complex operation)
+                                FC_TABLE_FILL: begin
+                                    // TODO: Implement table.fill loop
+                                    trapped <= 1'b1;
+                                    trap_code <= TRAP_UNREACHABLE;
+                                    state <= STATE_TRAP;
+                                end
+
+                                // 0x0C: table.init, 0x0D: elem.drop, 0x0E: table.copy
+                                // These require element segment handling - trap for now
+                                FC_TABLE_INIT, FC_ELEM_DROP, FC_TABLE_COPY: begin
+                                    trapped <= 1'b1;
+                                    trap_code <= TRAP_UNREACHABLE;
+                                    state <= STATE_TRAP;
+                                end
+
+                                default: begin
+                                    // Unknown FC opcode - skip
+                                    pc <= saved_next_pc;
+                                    state <= STATE_FETCH;
+                                end
+                            endcase
                         end
 
                         default: begin
@@ -2257,6 +2633,15 @@ module wasm_cpu
                         pc <= saved_next_pc;
                         state <= STATE_FETCH;
                     end
+                    else if (saved_decoded.opcode == OP_REF_NULL ||
+                             saved_decoded.opcode == OP_REF_IS_NULL ||
+                             saved_decoded.opcode == OP_REF_FUNC) begin
+                        // Reference type instructions - push the pre-computed result
+                        stack_push_data.vtype <= exec_result_type;
+                        stack_push_data.value <= exec_result;
+                        pc <= saved_next_pc;
+                        state <= STATE_FETCH;
+                    end
                 end
 
                 STATE_CALL: begin
@@ -2370,6 +2755,7 @@ module wasm_cpu
                             skip_len = {28'b0, 4'd1 + type_len + leb128_len(pc + 1 + {28'b0, type_len})};
                         end
                         8'h20, 8'h21, 8'h22, 8'h23, 8'h24: skip_len = {28'b0, 4'd1 + leb128_len(pc + 1)};  // local/global ops
+                        8'h25, 8'h26: skip_len = {28'b0, 4'd1 + leb128_len(pc + 1)};  // table.get, table.set (tableidx LEB128)
                         8'h41: skip_len = {28'b0, 4'd1 + leb128_len(pc + 1)};  // i32.const
                         8'h42: skip_len = {28'b0, 4'd1 + leb128_len(pc + 1)};  // i64.const
                         8'h43: skip_len = 5;  // f32.const
@@ -2378,6 +2764,15 @@ module wasm_cpu
                         8'h30, 8'h31, 8'h32, 8'h33, 8'h34, 8'h35, 8'h36, 8'h37,
                         8'h38, 8'h39, 8'h3A, 8'h3B, 8'h3C, 8'h3D, 8'h3E: skip_len = {28'b0, 4'd1 + memarg_len(pc + 1)};  // memory ops (align + offset as LEB128s)
                         8'h3F, 8'h40: skip_len = {28'b0, 4'd1 + leb128_len(pc + 1)};  // memory.size, memory.grow (memidx as LEB128)
+                        // Reference type instructions (0xD0 - 0xD6)
+                        8'hD0: skip_len = {28'b0, 4'd1 + leb128_len(pc + 1)};  // ref.null (heaptype LEB128)
+                        8'hD1: skip_len = 1;  // ref.is_null (no immediate)
+                        8'hD2: skip_len = {28'b0, 4'd1 + leb128_len(pc + 1)};  // ref.func (funcidx LEB128)
+                        8'hD3: skip_len = 1;  // ref.as_non_null (no immediate)
+                        8'hD5: skip_len = {28'b0, 4'd1 + leb128_len(pc + 1)};  // br_on_null (labelidx LEB128)
+                        8'hD6: skip_len = {28'b0, 4'd1 + leb128_len(pc + 1)};  // br_on_non_null (labelidx LEB128)
+                        // Extended opcodes (0xFC prefix) - handled by decoder
+                        8'hFC: skip_len = {28'b0, decoded.instr_length};  // Use decoded length for FC prefix
                         default: skip_len = 1;  // Simple opcodes
                     endcase
 
@@ -2426,6 +2821,7 @@ module wasm_cpu
                             skip_len = {28'b0, 4'd1 + type_len + leb128_len(pc + 1 + {28'b0, type_len})};
                         end
                         8'h20, 8'h21, 8'h22, 8'h23, 8'h24: skip_len = {28'b0, 4'd1 + leb128_len(pc + 1)};  // local/global ops
+                        8'h25, 8'h26: skip_len = {28'b0, 4'd1 + leb128_len(pc + 1)};  // table.get, table.set (tableidx LEB128)
                         8'h41: skip_len = {28'b0, 4'd1 + leb128_len(pc + 1)};  // i32.const
                         8'h42: skip_len = {28'b0, 4'd1 + leb128_len(pc + 1)};  // i64.const
                         8'h43: skip_len = 5;  // f32.const
@@ -2434,6 +2830,15 @@ module wasm_cpu
                         8'h30, 8'h31, 8'h32, 8'h33, 8'h34, 8'h35, 8'h36, 8'h37,
                         8'h38, 8'h39, 8'h3A, 8'h3B, 8'h3C, 8'h3D, 8'h3E: skip_len = {28'b0, 4'd1 + memarg_len(pc + 1)};  // memory ops (align + offset as LEB128s)
                         8'h3F, 8'h40: skip_len = {28'b0, 4'd1 + leb128_len(pc + 1)};  // memory.size, memory.grow (memidx as LEB128)
+                        // Reference type instructions (0xD0 - 0xD6)
+                        8'hD0: skip_len = {28'b0, 4'd1 + leb128_len(pc + 1)};  // ref.null (heaptype LEB128)
+                        8'hD1: skip_len = 1;  // ref.is_null (no immediate)
+                        8'hD2: skip_len = {28'b0, 4'd1 + leb128_len(pc + 1)};  // ref.func (funcidx LEB128)
+                        8'hD3: skip_len = 1;  // ref.as_non_null (no immediate)
+                        8'hD5: skip_len = {28'b0, 4'd1 + leb128_len(pc + 1)};  // br_on_null (labelidx LEB128)
+                        8'hD6: skip_len = {28'b0, 4'd1 + leb128_len(pc + 1)};  // br_on_non_null (labelidx LEB128)
+                        // Extended opcodes (0xFC prefix) - handled by decoder
+                        8'hFC: skip_len = {28'b0, decoded.instr_length};  // Use decoded length for FC prefix
                         default: skip_len = 1;
                     endcase
 
@@ -2683,6 +3088,86 @@ module wasm_cpu
                     end
                 end
 
+                // STATE_TABLE_GROW_WAIT: Not used anymore - table.grow traps to S-mode
+                // Kept for backward compatibility; should not be reached
+                STATE_TABLE_GROW_WAIT: begin
+                    // This state is deprecated; table.grow now traps to S-mode
+                    state <= STATE_TRAP;
+                end
+
+                // STATE_TABLE_CACHE_MISS: Wait for memory read of table entry
+                STATE_TABLE_CACHE_MISS: begin
+                    // Check for memory error (out of bounds)
+                    if (mem_resp_i.error || mem_trap_i != TRAP_NONE) begin
+                        trapped <= 1'b1;
+                        trap_code <= TRAP_OUT_OF_BOUNDS;
+                        state <= STATE_TRAP;
+                    end else if (mem_resp_i.rvalid) begin
+                        // Got the table entry from memory
+                        automatic logic [31:0] fetched_data = mem_resp_i.rdata[31:0];
+                        automatic logic [3:0] cache_idx = {table_miss_table_idx, table_miss_elem_idx[1:0]};
+
+                        if (table_miss_is_table_set) begin
+                            // This was a table.set with cache miss - write already issued
+                            // Just update cache with the new value we wrote
+                            table_cache[cache_idx].valid <= 1'b1;
+                            table_cache[cache_idx].table_idx <= table_miss_table_idx;
+                            table_cache[cache_idx].elem_idx <= table_miss_elem_idx;
+                            table_cache[cache_idx].data <= table_miss_write_data;
+                            pc <= saved_next_pc;
+                            state <= STATE_FETCH;
+                        end else begin
+                            // Update cache with fetched data
+                            table_cache[cache_idx].valid <= 1'b1;
+                            table_cache[cache_idx].table_idx <= table_miss_table_idx;
+                            table_cache[cache_idx].elem_idx <= table_miss_elem_idx;
+                            table_cache[cache_idx].data <= fetched_data;
+
+                            if (table_miss_is_call_indirect) begin
+                                // Continue call_indirect with fetched data
+                                automatic logic [15:0] target_func_idx = fetched_data[15:0];
+
+                                // Check if element is null (REF_NULL_VALUE)
+                                if (fetched_data == REF_NULL_VALUE) begin
+                                    trapped <= 1'b1;
+                                    trap_code <= TRAP_UNINITIALIZED_ELEMENT;
+                                    state <= STATE_TRAP;
+                                end else begin
+                                    // Structural type check
+                                    automatic type_entry_t expected_type = type_table[saved_decoded.immediate[7:0]];
+                                    automatic type_entry_t actual_type = type_table[func_table[target_func_idx].type_idx[7:0]];
+
+                                    if (expected_type.param_count != actual_type.param_count ||
+                                        expected_type.result_count != actual_type.result_count ||
+                                        expected_type.param_types != actual_type.param_types ||
+                                        expected_type.result_types != actual_type.result_types) begin
+                                        trapped <= 1'b1;
+                                        trap_code <= TRAP_INDIRECT_CALL_TYPE_MISMATCH;
+                                        state <= STATE_TRAP;
+                                    end else begin
+                                        // Set up the call
+                                        call_func_idx <= target_func_idx;
+                                        call_param_count <= func_table[target_func_idx].param_count;
+                                        call_arg_idx <= 8'd0;
+                                        call_peek_offset <= {8'b0, func_table[target_func_idx].param_count - 8'd1};
+                                        call_new_local_base <= current_frame.local_base +
+                                                               func_table[current_frame.func_idx].param_count +
+                                                               func_table[current_frame.func_idx].local_count;
+                                        state <= STATE_CALL;
+                                    end
+                                end
+                            end else begin
+                                // table.get - push result
+                                stack_push_en <= 1'b1;
+                                stack_push_data.vtype <= valtype_t'(table_metadata_type[table_miss_table_idx]);
+                                stack_push_data.value <= {32'b0, fetched_data};
+                                pc <= saved_next_pc;
+                                state <= STATE_FETCH;
+                            end
+                        end
+                    end
+                end
+
                 STATE_CAPTURE_RESULTS: begin
                     // Capture multi-value results from stack before halting
                     // Results are on stack: result[0] at bottom, result[N-1] at TOS
@@ -2717,7 +3202,8 @@ module wasm_cpu
                     trapped <= 1'b1;
                     halted <= 1'b1;
 
-                    if (ext_halt_i && (trap_code == TRAP_IMPORT || trap_code == TRAP_MEMORY_GROW)) begin
+                    if (ext_halt_i && (trap_code == TRAP_IMPORT || trap_code == TRAP_MEMORY_GROW ||
+                                       trap_code == TRAP_TABLE_GROW)) begin
                         // Supervisor is connected and wants to handle this trap
                         // Transition to EXT_HALT to wait for resume
                         state <= STATE_EXT_HALT;
@@ -2771,8 +3257,9 @@ module wasm_cpu
                             pc <= ext_resume_pc_i;
                         end
                         // If resume_val is provided, push it on stack (for return values)
-                        // Always push for TRAP_IMPORT and TRAP_MEMORY_GROW (they always return a value)
-                        if (ext_resume_val_i != '0 || trap_code == TRAP_IMPORT || trap_code == TRAP_MEMORY_GROW) begin
+                        // Always push for TRAP_IMPORT, TRAP_MEMORY_GROW, TRAP_TABLE_GROW (they always return a value)
+                        if (ext_resume_val_i != '0 || trap_code == TRAP_IMPORT ||
+                            trap_code == TRAP_MEMORY_GROW || trap_code == TRAP_TABLE_GROW) begin
                             stack_push_en <= 1'b1;
                             stack_push_data.vtype <= TYPE_I32;
                             stack_push_data.value <= {32'b0, ext_resume_val_i};
@@ -2782,6 +3269,14 @@ module wasm_cpu
                         if (trap_code == TRAP_MEMORY_GROW && ext_resume_val_i != 32'hFFFFFFFF) begin
                             mem_grow_en <= 1'b1;
                             mem_grow_pages <= import_arg0_q;
+                        end
+                        // For TABLE_GROW: if supervisor approved (result != -1), update table size
+                        // The supervisor returns the old size on success, or -1 on failure
+                        // The actual metadata update is done by supervisor, but we need to
+                        // update the internal metadata register too
+                        if (trap_code == TRAP_TABLE_GROW && ext_resume_val_i != 32'hFFFFFFFF) begin
+                            table_metadata_size[table_grow_table_idx] <=
+                                table_metadata_size[table_grow_table_idx] + table_grow_delta[15:0];
                         end
                         state <= STATE_FETCH;
                         halted <= 1'b0;
@@ -2818,7 +3313,8 @@ module wasm_cpu
     // CPU is externally halted when in STATE_EXT_HALT or transitioning to it
     assign ext_halted_o = (state == STATE_EXT_HALT) ||
                           (state == STATE_TRAP && ext_halt_i &&
-                           (trap_code == TRAP_IMPORT || trap_code == TRAP_MEMORY_GROW));
+                           (trap_code == TRAP_IMPORT || trap_code == TRAP_MEMORY_GROW ||
+                            trap_code == TRAP_TABLE_GROW));
 
     // Import trap information outputs
     assign import_id_o   = import_id_q;
@@ -2826,5 +3322,9 @@ module wasm_cpu
     assign import_arg1_o = import_arg1_q;
     assign import_arg2_o = import_arg2_q;
     assign import_arg3_o = import_arg3_q;
+
+    // Table grow trap information outputs
+    assign table_grow_table_idx_o = table_grow_table_idx;
+    assign table_grow_delta_o     = table_grow_delta;
 
 endmodule

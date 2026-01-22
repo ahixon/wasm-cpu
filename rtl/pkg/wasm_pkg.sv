@@ -19,6 +19,13 @@ package wasm_pkg;
     } valtype_t;
 
     // =========================================================================
+    // Reference Type Constants
+    // =========================================================================
+    // Null reference value - used for ref.null and null checks
+    // Use 0xFFFFFFFF as sentinel since valid function indices are smaller
+    localparam logic [31:0] REF_NULL_VALUE = 32'hFFFF_FFFF;
+
+    // =========================================================================
     // Instruction Opcodes (based on WebAssembly binary format)
     // =========================================================================
 
@@ -235,10 +242,48 @@ package wasm_pkg;
         OP_I64_EXTEND16_S = 8'hC3,
         OP_I64_EXTEND32_S = 8'hC4,
 
+        // Reference types (0xD0 - 0xD6)
+        OP_REF_NULL       = 8'hD0,  // ref.null t -> (ref null t)
+        OP_REF_IS_NULL    = 8'hD1,  // (ref t) -> i32
+        OP_REF_FUNC       = 8'hD2,  // $funcidx -> funcref
+        OP_REF_AS_NON_NULL = 8'hD3, // (ref null t) -> (ref t) or trap
+        OP_BR_ON_NULL     = 8'hD5,  // branch if reference is null
+        OP_BR_ON_NON_NULL = 8'hD6,  // branch if reference is not null
+
         // Prefix for extended opcodes
         OP_PREFIX_FC      = 8'hFC,
         OP_PREFIX_FD      = 8'hFD
     } opcode_t;
+
+    // =========================================================================
+    // Extended Opcodes (0xFC prefix)
+    // =========================================================================
+    // These are sub-opcodes following the 0xFC prefix byte
+    typedef enum logic [7:0] {
+        // Saturating truncation instructions
+        FC_I32_TRUNC_SAT_F32_S = 8'h00,
+        FC_I32_TRUNC_SAT_F32_U = 8'h01,
+        FC_I32_TRUNC_SAT_F64_S = 8'h02,
+        FC_I32_TRUNC_SAT_F64_U = 8'h03,
+        FC_I64_TRUNC_SAT_F32_S = 8'h04,
+        FC_I64_TRUNC_SAT_F32_U = 8'h05,
+        FC_I64_TRUNC_SAT_F64_S = 8'h06,
+        FC_I64_TRUNC_SAT_F64_U = 8'h07,
+
+        // Bulk memory operations
+        FC_MEMORY_INIT        = 8'h08,  // memory.init data_idx mem_idx
+        FC_DATA_DROP          = 8'h09,  // data.drop data_idx
+        FC_MEMORY_COPY        = 8'h0A,  // memory.copy dst_mem src_mem
+        FC_MEMORY_FILL        = 8'h0B,  // memory.fill mem_idx
+
+        // Table operations
+        FC_TABLE_INIT         = 8'h0C,  // table.init elem_idx table_idx
+        FC_ELEM_DROP          = 8'h0D,  // elem.drop elem_idx
+        FC_TABLE_COPY         = 8'h0E,  // table.copy dst_table src_table
+        FC_TABLE_GROW         = 8'h0F,  // table.grow table_idx
+        FC_TABLE_SIZE         = 8'h10,  // table.size table_idx
+        FC_TABLE_FILL         = 8'h11   // table.fill table_idx
+    } fc_opcode_t;
 
     // =========================================================================
     // ALU Operation Types
@@ -368,6 +413,64 @@ package wasm_pkg;
         logic        grow_done;        // Grow operation complete
     } mem_mgmt_resp_t;
 
+    // =========================================================================
+    // Table Bus Interface (for externalized table storage)
+    // =========================================================================
+
+    // Table bus request (CPU -> Table)
+    typedef struct packed {
+        logic        valid;
+        logic        write;       // 0=read, 1=write
+        logic [1:0]  table_idx;   // Which table (0-3)
+        logic [15:0] elem_idx;    // Element index
+        logic [31:0] wdata;       // Write data
+    } table_bus_req_t;
+
+    // Table bus response (Table -> CPU) - single-cycle combinational read
+    typedef struct packed {
+        logic        ready;
+        logic        rvalid;
+        logic [31:0] rdata;
+        logic [3:0]  elem_type;   // TYPE_FUNCREF or TYPE_EXTERNREF
+        logic        error;       // Out of bounds
+    } table_bus_resp_t;
+
+    // Table management request
+    typedef struct packed {
+        logic        init_valid;
+        logic [1:0]  init_table_idx;
+        logic [15:0] init_size;
+        logic [15:0] init_max_size;
+        logic [3:0]  init_type;
+        logic        elem_init_valid;
+        logic [1:0]  elem_table_idx;
+        logic [15:0] elem_idx;
+        logic [31:0] elem_value;
+        logic        grow_valid;
+        logic [1:0]  grow_table_idx;
+        logic [31:0] grow_delta;
+        logic [31:0] grow_init_val;
+    } table_mgmt_req_t;
+
+    // Table management response
+    // Note: Arrays flattened to avoid unpacked arrays in packed struct
+    typedef struct packed {
+        logic [15:0] size_0;
+        logic [15:0] size_1;
+        logic [15:0] size_2;
+        logic [15:0] size_3;
+        logic [15:0] max_size_0;
+        logic [15:0] max_size_1;
+        logic [15:0] max_size_2;
+        logic [15:0] max_size_3;
+        logic [3:0]  elem_type_0;
+        logic [3:0]  elem_type_1;
+        logic [3:0]  elem_type_2;
+        logic [3:0]  elem_type_3;
+        logic [31:0] grow_result;
+        logic        grow_done;
+    } table_mgmt_resp_t;
+
     // Helper function: Convert mem_op_t to mem_size_t
     function automatic mem_size_t mem_op_to_size(mem_op_t op);
         case (op)
@@ -425,6 +528,8 @@ package wasm_pkg;
         STATE_BR_TABLE,      // Processing br_table targets
         STATE_BR_UNWIND,     // Unwinding stack after branch
         STATE_CAPTURE_RESULTS, // Capturing multi-value results before halt
+        STATE_TABLE_GROW_WAIT, // Waiting for table.grow size update to propagate
+        STATE_TABLE_CACHE_MISS, // Waiting for table entry fetch from memory
         STATE_TRAP,
         STATE_HALT,
         STATE_EXT_HALT       // Halted by external supervisor, waiting for resume
@@ -433,7 +538,7 @@ package wasm_pkg;
     // =========================================================================
     // Trap Types
     // =========================================================================
-    typedef enum logic [3:0] {
+    typedef enum logic [4:0] {
         TRAP_NONE,
         TRAP_UNREACHABLE,
         TRAP_INT_DIV_ZERO,
@@ -447,7 +552,9 @@ package wasm_pkg;
         TRAP_STACK_UNDERFLOW,
         TRAP_CALL_STACK_EXHAUSTED,
         TRAP_IMPORT,         // Unresolved import (WASI call) - requires S-mode handling
-        TRAP_MEMORY_GROW     // memory.grow request - requires S-mode approval
+        TRAP_MEMORY_GROW,    // memory.grow request - requires S-mode approval
+        TRAP_NULL_REFERENCE, // Null reference dereference (ref.as_non_null)
+        TRAP_TABLE_GROW      // table.grow request - requires S-mode approval
     } trap_t;
 
     // =========================================================================
@@ -462,6 +569,19 @@ package wasm_pkg;
     parameter int MAX_FUNCTIONS = 1024;     // Max functions in module
     parameter int MAX_GLOBALS = 256;        // Max globals
     parameter int MAX_TABLES = 16;          // Max tables
+
+    // Table cache parameters
+    parameter int TABLE_CACHE_SIZE = 16;    // 16-entry direct-mapped cache (4 per table)
+
+    // =========================================================================
+    // Table Cache Entry (for memory-backed tables with caching)
+    // =========================================================================
+    typedef struct packed {
+        logic        valid;
+        logic [1:0]  table_idx;
+        logic [15:0] elem_idx;
+        logic [31:0] data;
+    } table_cache_entry_t;
 
     // =========================================================================
     // Stack Entry (64-bit value with type tag)
