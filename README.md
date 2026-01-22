@@ -36,14 +36,20 @@ make wasm-tests
 Implemented:
 - MVP integer operations (i32, i64)
 - MVP floating-point operations (f32, f64)
-- Linear memory
-- Control flow (blocks, loops, branches, calls)
+- Saturating truncation operations
+- Linear memory (up to 256 pages / 16 MB)
+- Control flow (blocks, loops, branches, calls, call_indirect)
 - Local and global variables
+- Reference types (funcref, externref)
+- Table operations (table.get, table.set, table.size, table.grow)
+- Reference instructions (ref.null, ref.is_null, ref.func, ref.as_non_null)
+- Reference branching (br_on_null, br_on_non_null)
 
 Not yet implemented (skipped in tests):
 - SIMD (128-bit vector operations)
-- Reference types (externref, funcref, typed function references)
-- Bulk memory operations
+- Bulk memory operations (memory.init, memory.copy, memory.fill)
+- Element segment operations (table.init, elem.drop)
+- Typed function references (call_ref, return_call_ref)
 - Exception handling
 - Multiple memories (multi-memory proposal)
 - GC proposal
