@@ -10,8 +10,8 @@ module wasm_decoder
     // Input: instruction bytes from code memory
     input  logic        valid_in,
     input  logic [31:0] pc,
-    input  logic [7:0]  instr_bytes [0:15],  // Up to 16 bytes lookahead
-    input  logic [3:0]  bytes_available,
+    input  logic [7:0]  instr_bytes [0:19],  // Up to 20 bytes lookahead (for v128.const)
+    input  logic [4:0]  bytes_available,
 
     // Output: decoded instruction
     output logic        valid_out,
@@ -125,15 +125,16 @@ module wasm_decoder
 
                     if (type_byte == 8'h40) begin
                         // Empty block type
-                        decoded.immediate = 64'hFFFFFFFF;  // Marker for void
+                        decoded.immediate = 128'hFFFFFFFF;  // Marker for void
                         decoded.instr_length = 8'd2;
-                    end else if (type_byte >= 8'h7C && type_byte <= 8'h7F) begin
-                        // Single value type (i32/i64/f32/f64)
-                        decoded.immediate = {56'b0, type_byte};
+                    end else if (type_byte >= 8'h7B && type_byte <= 8'h7F) begin
+                        // Single value type (i32/i64/f32/f64/v128)
+                        // 0x7F=i32, 0x7E=i64, 0x7D=f32, 0x7C=f64, 0x7B=v128
+                        decoded.immediate = {120'b0, type_byte};
                         decoded.instr_length = 8'd2;
                     end else if (type_byte == 8'h70 || type_byte == 8'h6F) begin
                         // Reference type (funcref or externref)
-                        decoded.immediate = {56'b0, type_byte};
+                        decoded.immediate = {120'b0, type_byte};
                         decoded.instr_length = 8'd2;
                     end else if (type_byte == 8'h63 || type_byte == 8'h64) begin
                         // Typed reference: ref null t (0x63) or ref t (0x64)
@@ -499,9 +500,133 @@ module wasm_decoder
                     for (int i = 0; i < 10; i++) begin
                         leb_bytes[i] = instr_bytes[i+1];
                     end
-                    decoded.immediate = decode_uleb128(leb_bytes, len);
+                    decoded.immediate = {64'b0, decode_uleb128(leb_bytes, len)};
                     decoded.instr_length = 8'd1 + {4'b0, len};
                     decoded.has_immediate = 1'b1;
+                end
+
+                // SIMD opcodes (0xFD prefix)
+                // Format: 0xFD <sub_opcode:LEB128> [immediates...]
+                // immediate[8:0] = sub-opcode, immediate2 = offset for memory ops
+                // For v128.const: immediate[127:0] = the 128-bit constant value
+                8'hFD: begin
+                    logic [3:0] len1, len2, len3;
+                    logic [7:0] leb_bytes [0:9];
+                    logic [63:0] sub_opcode;
+
+                    // Decode sub-opcode (LEB128 encoded)
+                    for (int i = 0; i < 10; i++) begin
+                        leb_bytes[i] = instr_bytes[i+1];
+                    end
+                    sub_opcode = decode_uleb128(leb_bytes, len1);
+                    decoded.has_immediate = 1'b1;
+
+                    case (sub_opcode[8:0])
+                        // v128.load, v128.store - memarg (align + offset)
+                        9'h000, 9'h00B: begin
+                            // v128.load (0x00), v128.store (0x0B)
+                            decoded.immediate = {119'b0, sub_opcode[8:0]};
+                            // Decode align (skip it) and offset
+                            for (int i = 0; i < 10; i++) begin
+                                leb_bytes[i] = instr_bytes[i+1+len1];
+                            end
+                            decode_uleb128(leb_bytes, len2);  // align (ignored)
+                            for (int i = 0; i < 10; i++) begin
+                                leb_bytes[i] = instr_bytes[i+1+len1+len2];
+                            end
+                            decoded.immediate2 = decode_uleb128(leb_bytes, len3);  // offset
+                            decoded.instr_length = 8'd1 + {4'b0, len1} + {4'b0, len2} + {4'b0, len3};
+                            decoded.has_immediate2 = 1'b1;
+                        end
+
+                        // v128.loadNxM_s/u, v128.loadN_splat, v128.loadN_zero
+                        9'h001, 9'h002, 9'h003, 9'h004, 9'h005, 9'h006,  // load extend
+                        9'h007, 9'h008, 9'h009, 9'h00A,                   // load splat
+                        9'h05C, 9'h05D: begin                             // load zero
+                            decoded.immediate = {119'b0, sub_opcode[8:0]};
+                            // Decode memarg
+                            for (int i = 0; i < 10; i++) begin
+                                leb_bytes[i] = instr_bytes[i+1+len1];
+                            end
+                            decode_uleb128(leb_bytes, len2);  // align
+                            for (int i = 0; i < 10; i++) begin
+                                leb_bytes[i] = instr_bytes[i+1+len1+len2];
+                            end
+                            decoded.immediate2 = decode_uleb128(leb_bytes, len3);  // offset
+                            decoded.instr_length = 8'd1 + {4'b0, len1} + {4'b0, len2} + {4'b0, len3};
+                            decoded.has_immediate2 = 1'b1;
+                        end
+
+                        // v128.const - 16 bytes of immediate data
+                        9'h00C: begin
+                            // Store sub-opcode in immediate[8:0] for consistent dispatch
+                            decoded.immediate = {119'b0, 9'h00C};
+                            // Read 16 bytes in little-endian order into immediate2
+                            decoded.immediate2 = {instr_bytes[1+len1+15], instr_bytes[1+len1+14],
+                                                  instr_bytes[1+len1+13], instr_bytes[1+len1+12],
+                                                  instr_bytes[1+len1+11], instr_bytes[1+len1+10],
+                                                  instr_bytes[1+len1+9],  instr_bytes[1+len1+8],
+                                                  instr_bytes[1+len1+7],  instr_bytes[1+len1+6],
+                                                  instr_bytes[1+len1+5],  instr_bytes[1+len1+4],
+                                                  instr_bytes[1+len1+3],  instr_bytes[1+len1+2],
+                                                  instr_bytes[1+len1+1],  instr_bytes[1+len1]};
+                            decoded.instr_length = 8'd1 + {4'b0, len1} + 8'd16;
+                            decoded.has_immediate2 = 1'b1;
+                        end
+
+                        // i8x16.shuffle - 16 lane indices
+                        9'h00D: begin
+                            // Store sub-opcode in immediate[8:0] for consistent dispatch
+                            decoded.immediate = {119'b0, 9'h00D};
+                            // Read 16 lane indices into immediate2
+                            decoded.immediate2 = {instr_bytes[1+len1+15], instr_bytes[1+len1+14],
+                                                 instr_bytes[1+len1+13], instr_bytes[1+len1+12],
+                                                 instr_bytes[1+len1+11], instr_bytes[1+len1+10],
+                                                 instr_bytes[1+len1+9],  instr_bytes[1+len1+8],
+                                                 instr_bytes[1+len1+7],  instr_bytes[1+len1+6],
+                                                 instr_bytes[1+len1+5],  instr_bytes[1+len1+4],
+                                                 instr_bytes[1+len1+3],  instr_bytes[1+len1+2],
+                                                 instr_bytes[1+len1+1],  instr_bytes[1+len1]};
+                            decoded.instr_length = 8'd1 + {4'b0, len1} + 8'd16;
+                            decoded.has_immediate2 = 1'b1;
+                        end
+
+                        // Lane extract/replace operations - single lane index byte
+                        9'h015, 9'h016, 9'h017,  // i8x16 extract/replace
+                        9'h018, 9'h019, 9'h01A,  // i16x8 extract/replace
+                        9'h01B, 9'h01C,          // i32x4 extract/replace
+                        9'h01D, 9'h01E,          // i64x2 extract/replace
+                        9'h01F, 9'h020,          // f32x4 extract/replace
+                        9'h021, 9'h022: begin    // f64x2 extract/replace
+                            decoded.immediate = {111'b0, instr_bytes[1+len1], sub_opcode[8:0]};
+                            decoded.instr_length = 8'd1 + {4'b0, len1} + 8'd1;
+                        end
+
+                        // v128.loadN_lane, v128.storeN_lane - memarg + laneidx
+                        9'h054, 9'h055, 9'h056, 9'h057,  // load lane
+                        9'h058, 9'h059, 9'h05A, 9'h05B: begin  // store lane
+                            decoded.immediate = {119'b0, sub_opcode[8:0]};
+                            // Decode memarg
+                            for (int i = 0; i < 10; i++) begin
+                                leb_bytes[i] = instr_bytes[i+1+len1];
+                            end
+                            decode_uleb128(leb_bytes, len2);  // align
+                            for (int i = 0; i < 10; i++) begin
+                                leb_bytes[i] = instr_bytes[i+1+len1+len2];
+                            end
+                            decoded.immediate2 = decode_uleb128(leb_bytes, len3);  // offset
+                            // Lane index is after offset
+                            decoded.immediate2[15:8] = instr_bytes[1+len1+len2+len3];  // laneidx
+                            decoded.instr_length = 8'd1 + {4'b0, len1} + {4'b0, len2} + {4'b0, len3} + 8'd1;
+                            decoded.has_immediate2 = 1'b1;
+                        end
+
+                        // All other SIMD operations - no immediates beyond sub-opcode
+                        default: begin
+                            decoded.immediate = {119'b0, sub_opcode[8:0]};
+                            decoded.instr_length = 8'd1 + {4'b0, len1};
+                        end
+                    endcase
                 end
 
                 default: begin

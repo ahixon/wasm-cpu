@@ -42,6 +42,7 @@ class ModuleAssertion:
     expected: Optional[List[Tuple[str, Any]]]  # List of (type, value) for multi-value returns
     is_trap: bool
     is_invoke_only: bool = False  # Plain invoke for side effects
+    alternatives: Optional[List[List[Tuple[str, Any]]]] = None  # For (either ...) - list of alternative expected results
 
 
 @dataclass
@@ -71,11 +72,12 @@ def convert_wat_to_wasm(wat_code: str, output_path: Path) -> bool:
 def parse_value(s: str) -> Tuple[str, Any]:
     """Parse a value like (i32.const 42) or (f32.const 1.5)."""
     # Handle integer types
-    match = re.match(r'\(\s*(i32|i64)\.const\s+(-?[\d_]+|0x[0-9a-fA-F_]+)\s*\)', s)
+    # -0x... is negative hex, 0x... is positive hex, -?[\d_]+ is decimal
+    match = re.match(r'\(\s*(i32|i64)\.const\s+(-?0x[0-9a-fA-F_]+|-?[\d_]+)\s*\)', s)
     if match:
         vtype = match.group(1)
         val_str = match.group(2).replace('_', '')
-        val = int(val_str, 16) if val_str.startswith('0x') or val_str.startswith('-0x') else int(val_str)
+        val = int(val_str, 16) if '0x' in val_str.lower() else int(val_str)
         return vtype, val
 
     # Handle float types (simplified - just handle common cases)
@@ -86,10 +88,10 @@ def parse_value(s: str) -> Tuple[str, Any]:
         # Handle special values
         if 'nan' in val_str.lower():
             is_negative = val_str.startswith('-')
-            # Check for NaN with specific payload: nan:0x... or -nan:0x...
-            nan_match = re.match(r'-?nan:0x([0-9a-fA-F]+)', val_str)
+            # Check for NaN with specific payload: nan:0x... or -nan:0x... (underscores allowed)
+            nan_match = re.match(r'-?nan:0x([0-9a-fA-F_]+)', val_str)
             if nan_match:
-                payload = int(nan_match.group(1), 16)
+                payload = int(nan_match.group(1).replace('_', ''), 16)
                 return vtype, ('nan_payload', is_negative, payload)
             # Check for canonical NaN marker: nan:canonical
             if 'canonical' in val_str.lower():
@@ -124,17 +126,155 @@ def parse_value(s: str) -> Tuple[str, Any]:
         val = int(match.group(1))
         return 'externref', val
 
+    # Handle v128 types (SIMD vectors)
+    # Format: (v128.const i8x16 v0 v1 ... v15) or similar lane types
+    match = re.match(r'\(\s*v128\.const\s+(i8x16|i16x8|i32x4|i64x2|f32x4|f64x2)\s+(.+?)\s*\)', s)
+    if match:
+        lane_type = match.group(1)
+        values_str = match.group(2)
+        # Parse the individual lane values
+        values = []
+        for v in values_str.split():
+            v = v.strip().replace('_', '')
+            # Check for hex float first (0x...p or 0x...P with decimal point)
+            # Handle +0x... as well as 0x... and -0x...
+            if (v.startswith('0x') or v.startswith('-0x') or v.startswith('+0x')) and ('p' in v.lower() or '.' in v):
+                # Hex float literal like 0x1.fffffep127
+                try:
+                    values.append(float.fromhex(v))
+                except ValueError:
+                    values.append(0.0)
+            elif v.startswith('0x') or v.startswith('-0x') or v.startswith('+0x'):
+                # Regular hex integer
+                values.append(int(v, 16))
+            elif '.' in v or 'e' in v.lower() or 'inf' in v.lower() or 'nan' in v.lower() or (lane_type.startswith('f') and v in ('-0', '+0')):
+                # Float value
+                if 'inf' in v.lower():
+                    values.append(float('inf') if not v.startswith('-') else float('-inf'))
+                elif 'nan' in v.lower():
+                    # Handle -nan (negative NaN) vs nan (positive NaN)
+                    # Check for NaN with specific payload: nan:0x... or -nan:0x... (underscores allowed)
+                    import math
+                    nan_match = re.match(r'-?nan:0x([0-9a-fA-F_]+)', v)
+                    if nan_match:
+                        payload = int(nan_match.group(1).replace('_', ''), 16)
+                        # For f32: sign + 0x7F800000 (exponent) + payload
+                        # For f64: sign + 0x7FF0000000000000 + payload
+                        # We'll handle the bit manipulation during conversion
+                        if v.startswith('-'):
+                            values.append(('nan_payload', True, payload))
+                        else:
+                            values.append(('nan_payload', False, payload))
+                    elif v.startswith('-'):
+                        values.append(-float('nan'))  # Negative NaN
+                    else:
+                        values.append(float('nan'))   # Positive NaN
+                else:
+                    try:
+                        values.append(float(v))
+                    except ValueError:
+                        values.append(0.0)
+            else:
+                values.append(int(v))
+
+        # Convert to 128-bit value based on lane type
+        import struct
+        result = 0
+        if lane_type == 'i8x16':
+            for i, v in enumerate(values[:16]):
+                result |= (v & 0xFF) << (i * 8)
+        elif lane_type == 'i16x8':
+            for i, v in enumerate(values[:8]):
+                result |= (v & 0xFFFF) << (i * 16)
+        elif lane_type == 'i32x4':
+            for i, v in enumerate(values[:4]):
+                result |= (v & 0xFFFFFFFF) << (i * 32)
+        elif lane_type == 'i64x2':
+            for i, v in enumerate(values[:2]):
+                result |= (v & 0xFFFFFFFFFFFFFFFF) << (i * 64)
+        elif lane_type == 'f32x4':
+            for i, v in enumerate(values[:4]):
+                if isinstance(v, tuple) and v[0] == 'nan_payload':
+                    # Custom NaN with payload
+                    is_negative, payload = v[1], v[2]
+                    sign_bit = 0x80000000 if is_negative else 0
+                    bits = sign_bit | 0x7F800000 | (payload & 0x7FFFFF)
+                elif isinstance(v, (int, float)):
+                    # For f32x4, interpret integers as float values (not raw bits)
+                    bits = struct.unpack('<I', struct.pack('<f', float(v)))[0]
+                else:
+                    bits = v & 0xFFFFFFFF
+                result |= bits << (i * 32)
+        elif lane_type == 'f64x2':
+            for i, v in enumerate(values[:2]):
+                if isinstance(v, tuple) and v[0] == 'nan_payload':
+                    # Custom NaN with payload
+                    is_negative, payload = v[1], v[2]
+                    sign_bit = 0x8000000000000000 if is_negative else 0
+                    bits = sign_bit | 0x7FF0000000000000 | (payload & 0xFFFFFFFFFFFFF)
+                elif isinstance(v, (int, float)):
+                    # For f64x2, interpret integers as float values (not raw bits)
+                    bits = struct.unpack('<Q', struct.pack('<d', float(v)))[0]
+                else:
+                    bits = v & 0xFFFFFFFFFFFFFFFF
+                result |= bits << (i * 64)
+
+        return 'v128', result
+
     return None, None
 
 
 def parse_values(s: str) -> List[Tuple[str, Any]]:
     """Parse multiple values from a string."""
     values = []
-    for match in re.finditer(r'\([^)]+\)', s):
-        vtype, val = parse_value(match.group())
-        if vtype:
-            values.append((vtype, val))
+    # Find individual value expressions (handle nested parens)
+    i = 0
+    while i < len(s):
+        if s[i] == '(':
+            end = find_matching_paren(s, i)
+            if end != -1:
+                expr = s[i:end+1]
+                vtype, val = parse_value(expr)
+                if vtype:
+                    values.append((vtype, val))
+                i = end + 1
+            else:
+                i += 1
+        else:
+            i += 1
     return values
+
+
+def parse_either_alternatives(s: str) -> List[List[Tuple[str, Any]]]:
+    """Parse (either ...) construct and return list of alternative result sets."""
+    s = s.strip()
+    if not s.startswith('(either'):
+        return [parse_values(s)]  # Single result set
+
+    # Find the content inside (either ...)
+    if not s.startswith('(either'):
+        return [parse_values(s)]
+
+    # Extract alternatives from inside (either ...)
+    inner = s[7:-1].strip()  # Remove "(either" and final ")"
+
+    alternatives = []
+    i = 0
+    while i < len(inner):
+        if inner[i] == '(':
+            end = find_matching_paren(inner, i)
+            if end != -1:
+                alt_expr = inner[i:end+1]
+                alt_values = parse_values(alt_expr)
+                if alt_values:
+                    alternatives.append(alt_values)
+                i = end + 1
+            else:
+                i += 1
+        else:
+            i += 1
+
+    return alternatives if alternatives else [parse_values(s)]
 
 
 def find_matching_paren(text: str, start: int) -> int:
@@ -287,12 +427,19 @@ def parse_assertion(expr: str, export_map: Dict[str, int], is_trap: bool = False
     args_str = expr[args_start:invoke_end]
     args = parse_values(args_str)
 
-    # Extract expected values (supports multi-value returns)
+    # Extract expected values (supports multi-value returns and either alternatives)
     expected = None
+    alternatives = None
     if not is_trap and not is_invoke_only:
         expected_str = expr[invoke_end+1:-1].strip()
-        expected_values = parse_values(expected_str)
-        expected = expected_values if expected_values else None
+        # Check for (either ...) construct
+        if expected_str.startswith('(either'):
+            alternatives = parse_either_alternatives(expected_str)
+            # Use first alternative as primary expected for backwards compat
+            expected = alternatives[0] if alternatives else None
+        else:
+            expected_values = parse_values(expected_str)
+            expected = expected_values if expected_values else None
 
     return ModuleAssertion(
         func_name=func_name,
@@ -300,19 +447,26 @@ def parse_assertion(expr: str, export_map: Dict[str, int], is_trap: bool = False
         args=args,
         expected=expected,
         is_trap=is_trap,
-        is_invoke_only=is_invoke_only
+        is_invoke_only=is_invoke_only,
+        alternatives=alternatives
     )
 
 
-def encode_value(vtype: str, val) -> Tuple[int, int]:
-    """Encode a value to (type_code, hex_value) for the test list.
-    type_code: 0=i32, 1=i64, 2=f32, 3=f64, 5=funcref, 6=externref
+def encode_value(vtype: str, val):
+    """Encode a value to (type_code, hex_value) or (type_code, lo64, hi64) for v128.
+    type_code: 0=i32, 1=i64, 2=f32, 3=f64, 4=v128, 5=funcref, 6=externref
     Returns the raw bit representation."""
     import struct
     import math
 
-    type_codes = {'i32': 0, 'i64': 1, 'f32': 2, 'f64': 3, 'funcref': 5, 'externref': 6}
+    type_codes = {'i32': 0, 'i64': 1, 'f32': 2, 'f64': 3, 'v128': 4, 'funcref': 5, 'externref': 6}
     type_code = type_codes.get(vtype, 0)
+
+    if vtype == 'v128':
+        # Return type_code and lo/hi 64-bit parts
+        lo64 = val & 0xFFFFFFFFFFFFFFFF
+        hi64 = (val >> 64) & 0xFFFFFFFFFFFFFFFF
+        return type_code, lo64, hi64
 
     if vtype in ('funcref', 'externref'):
         # Reference types are 32-bit values
@@ -517,8 +671,13 @@ def run_module_tests(group: ModuleTestGroup, wasm_path: Path, verbose: bool = Fa
             # Encode arguments
             args_str = ""
             for arg_type, arg_val in assertion.args:
-                type_code, encoded_val = encode_value(arg_type, arg_val)
-                args_str += f" {type_code} {encoded_val:x}"
+                encoded = encode_value(arg_type, arg_val)
+                if len(encoded) == 3:  # v128: (type_code, lo64, hi64)
+                    type_code, lo64, hi64 = encoded
+                    args_str += f" {type_code} {lo64:x} {hi64:x}"
+                else:  # Regular: (type_code, value)
+                    type_code, encoded_val = encoded
+                    args_str += f" {type_code} {encoded_val:x}"
 
             num_args = len(assertion.args)
 
@@ -529,12 +688,33 @@ def run_module_tests(group: ModuleTestGroup, wasm_path: Path, verbose: bool = Fa
 
             if assertion.is_trap:
                 f.write(f"{assertion.func_idx} 1 {num_args}{args_str} 0\n")
+            elif assertion.alternatives and len(assertion.alternatives) > 1:
+                # Test with alternatives (mode 3) - any alternative can match
+                # Format: <func> 3 <nargs> [args] <nalts> [<nresults> <results>]...
+                alts_str = f" {len(assertion.alternatives)}"
+                for alt in assertion.alternatives:
+                    alt_results = ""
+                    for exp_type, exp_val in alt:
+                        encoded = encode_value(exp_type, exp_val)
+                        if len(encoded) == 3:  # v128
+                            type_code, lo64, hi64 = encoded
+                            alt_results += f" {type_code} {lo64:x} {hi64:x}"
+                        else:
+                            type_code, encoded_val = encoded
+                            alt_results += f" {type_code} {encoded_val:x}"
+                    alts_str += f" {len(alt)}{alt_results}"
+                f.write(f"{assertion.func_idx} 3 {num_args}{args_str}{alts_str}\n")
             else:
                 # Encode all expected results (supports multi-value returns)
                 results_str = ""
                 for exp_type, exp_val in assertion.expected:
-                    type_code, encoded_val = encode_value(exp_type, exp_val)
-                    results_str += f" {type_code} {encoded_val:x}"
+                    encoded = encode_value(exp_type, exp_val)
+                    if len(encoded) == 3:  # v128
+                        type_code, lo64, hi64 = encoded
+                        results_str += f" {type_code} {lo64:x} {hi64:x}"
+                    else:
+                        type_code, encoded_val = encoded
+                        results_str += f" {type_code} {encoded_val:x}"
                 num_results = len(assertion.expected)
                 f.write(f"{assertion.func_idx} 0 {num_args}{args_str} {num_results}{results_str}\n")
 
@@ -1057,8 +1237,6 @@ def main():
 
     # Tests to skip - features not yet implemented
     SKIP_TESTS = {
-        # WebAssembly 2.0 features (in scope, not yet implemented)
-        'simd',           # SIMD not implemented (Phase 6)
         # WebAssembly 3.0 features (out of scope - defer to S-mode firmware)
         'multi-memory',   # v3 - defer to S-mode
         'memory64',       # v3 - defer to S-mode
@@ -1086,6 +1264,14 @@ def main():
         bulk_memory_dir = spec_dir / 'bulk-memory'
         if bulk_memory_dir.exists():
             all_wast.extend(sorted(bulk_memory_dir.glob('*.wast')))
+        # Also include SIMD tests
+        simd_dir = spec_dir / 'simd'
+        if simd_dir.exists():
+            all_wast.extend(sorted(simd_dir.glob('*.wast')))
+        # Also include relaxed-simd tests
+        relaxed_simd_dir = spec_dir / 'relaxed-simd'
+        if relaxed_simd_dir.exists():
+            all_wast.extend(sorted(relaxed_simd_dir.glob('*.wast')))
         wast_files = [f for f in all_wast if not should_skip_test(f.name)]
     else:
         wast_files = [Path(arg) for arg in sys.argv[1:] if not arg.startswith('-')]

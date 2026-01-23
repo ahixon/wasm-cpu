@@ -99,17 +99,18 @@ module wasm_memory
     // Get access size in bytes from mem_size_t
     function automatic int size_to_bytes(mem_size_t sz);
         case (sz)
-            MEM_SIZE_1: return 1;
-            MEM_SIZE_2: return 2;
-            MEM_SIZE_4: return 4;
-            MEM_SIZE_8: return 8;
-            default:    return 4;
+            MEM_SIZE_1:  return 1;
+            MEM_SIZE_2:  return 2;
+            MEM_SIZE_4:  return 4;
+            MEM_SIZE_8:  return 8;
+            MEM_SIZE_16: return 16;
+            default:     return 4;
         endcase
     endfunction
 
     // Read logic and trap detection (combinational)
     always_comb begin
-        mem_resp_o.rdata = 64'h0;
+        mem_resp_o.rdata = 128'h0;
         mem_resp_o.rvalid = 1'b0;
         mem_resp_o.error = 1'b0;
         trap = TRAP_NONE;
@@ -132,7 +133,7 @@ module wasm_memory
                         trap = TRAP_OUT_OF_BOUNDS;
                         mem_resp_o.error = 1'b1;
                     end else begin
-                        mem_resp_o.rdata = {32'b0, mem[mem_req_i.addr+3], mem[mem_req_i.addr+2],
+                        mem_resp_o.rdata = {96'b0, mem[mem_req_i.addr+3], mem[mem_req_i.addr+2],
                                             mem[mem_req_i.addr+1], mem[mem_req_i.addr]};
                         mem_resp_o.rvalid = 1'b1;
                     end
@@ -143,7 +144,7 @@ module wasm_memory
                         trap = TRAP_OUT_OF_BOUNDS;
                         mem_resp_o.error = 1'b1;
                     end else begin
-                        mem_resp_o.rdata = {mem[mem_req_i.addr+7], mem[mem_req_i.addr+6],
+                        mem_resp_o.rdata = {64'b0, mem[mem_req_i.addr+7], mem[mem_req_i.addr+6],
                                             mem[mem_req_i.addr+5], mem[mem_req_i.addr+4],
                                             mem[mem_req_i.addr+3], mem[mem_req_i.addr+2],
                                             mem[mem_req_i.addr+1], mem[mem_req_i.addr]};
@@ -156,7 +157,7 @@ module wasm_memory
                         trap = TRAP_OUT_OF_BOUNDS;
                         mem_resp_o.error = 1'b1;
                     end else begin
-                        mem_resp_o.rdata = {32'b0, mem[mem_req_i.addr+3], mem[mem_req_i.addr+2],
+                        mem_resp_o.rdata = {96'b0, mem[mem_req_i.addr+3], mem[mem_req_i.addr+2],
                                             mem[mem_req_i.addr+1], mem[mem_req_i.addr]};
                         mem_resp_o.rvalid = 1'b1;
                     end
@@ -167,7 +168,7 @@ module wasm_memory
                         trap = TRAP_OUT_OF_BOUNDS;
                         mem_resp_o.error = 1'b1;
                     end else begin
-                        mem_resp_o.rdata = {mem[mem_req_i.addr+7], mem[mem_req_i.addr+6],
+                        mem_resp_o.rdata = {64'b0, mem[mem_req_i.addr+7], mem[mem_req_i.addr+6],
                                             mem[mem_req_i.addr+5], mem[mem_req_i.addr+4],
                                             mem[mem_req_i.addr+3], mem[mem_req_i.addr+2],
                                             mem[mem_req_i.addr+1], mem[mem_req_i.addr]};
@@ -180,7 +181,7 @@ module wasm_memory
                         trap = TRAP_OUT_OF_BOUNDS;
                         mem_resp_o.error = 1'b1;
                     end else begin
-                        mem_resp_o.rdata = {{56{mem[mem_req_i.addr][7]}}, mem[mem_req_i.addr]};
+                        mem_resp_o.rdata = {{120{mem[mem_req_i.addr][7]}}, mem[mem_req_i.addr]};
                         mem_resp_o.rvalid = 1'b1;
                     end
                 end
@@ -190,7 +191,7 @@ module wasm_memory
                         trap = TRAP_OUT_OF_BOUNDS;
                         mem_resp_o.error = 1'b1;
                     end else begin
-                        mem_resp_o.rdata = {56'b0, mem[mem_req_i.addr]};
+                        mem_resp_o.rdata = {120'b0, mem[mem_req_i.addr]};
                         mem_resp_o.rvalid = 1'b1;
                         // DEBUG
                         // synthesis translate_off
@@ -205,7 +206,7 @@ module wasm_memory
                         trap = TRAP_OUT_OF_BOUNDS;
                         mem_resp_o.error = 1'b1;
                     end else begin
-                        mem_resp_o.rdata = {{48{mem[mem_req_i.addr+1][7]}},
+                        mem_resp_o.rdata = {{112{mem[mem_req_i.addr+1][7]}},
                                             mem[mem_req_i.addr+1], mem[mem_req_i.addr]};
                         mem_resp_o.rvalid = 1'b1;
                     end
@@ -216,7 +217,7 @@ module wasm_memory
                         trap = TRAP_OUT_OF_BOUNDS;
                         mem_resp_o.error = 1'b1;
                     end else begin
-                        mem_resp_o.rdata = {48'b0, mem[mem_req_i.addr+1], mem[mem_req_i.addr]};
+                        mem_resp_o.rdata = {112'b0, mem[mem_req_i.addr+1], mem[mem_req_i.addr]};
                         mem_resp_o.rvalid = 1'b1;
                     end
                 end
@@ -229,7 +230,7 @@ module wasm_memory
                         logic [31:0] val;
                         val = {mem[mem_req_i.addr+3], mem[mem_req_i.addr+2],
                                mem[mem_req_i.addr+1], mem[mem_req_i.addr]};
-                        mem_resp_o.rdata = {{32{val[31]}}, val};
+                        mem_resp_o.rdata = {{96{val[31]}}, val};
                         mem_resp_o.rvalid = 1'b1;
                     end
                 end
@@ -239,7 +240,203 @@ module wasm_memory
                         trap = TRAP_OUT_OF_BOUNDS;
                         mem_resp_o.error = 1'b1;
                     end else begin
-                        mem_resp_o.rdata = {32'b0, mem[mem_req_i.addr+3], mem[mem_req_i.addr+2],
+                        mem_resp_o.rdata = {96'b0, mem[mem_req_i.addr+3], mem[mem_req_i.addr+2],
+                                            mem[mem_req_i.addr+1], mem[mem_req_i.addr]};
+                        mem_resp_o.rvalid = 1'b1;
+                    end
+                end
+
+                // SIMD v128 load - full 16-byte load
+                MEM_LOAD_V128: begin
+                    if (!in_read_bounds(mem_req_i.addr, 16)) begin
+                        trap = TRAP_OUT_OF_BOUNDS;
+                        mem_resp_o.error = 1'b1;
+                    end else begin
+                        mem_resp_o.rdata = {mem[mem_req_i.addr+15], mem[mem_req_i.addr+14],
+                                            mem[mem_req_i.addr+13], mem[mem_req_i.addr+12],
+                                            mem[mem_req_i.addr+11], mem[mem_req_i.addr+10],
+                                            mem[mem_req_i.addr+9],  mem[mem_req_i.addr+8],
+                                            mem[mem_req_i.addr+7],  mem[mem_req_i.addr+6],
+                                            mem[mem_req_i.addr+5],  mem[mem_req_i.addr+4],
+                                            mem[mem_req_i.addr+3],  mem[mem_req_i.addr+2],
+                                            mem[mem_req_i.addr+1],  mem[mem_req_i.addr]};
+                        mem_resp_o.rvalid = 1'b1;
+                    end
+                end
+
+                // SIMD splat loads - load single value and replicate
+                MEM_LOAD_V128_8_SPLAT: begin
+                    if (!in_read_bounds(mem_req_i.addr, 1)) begin
+                        trap = TRAP_OUT_OF_BOUNDS;
+                        mem_resp_o.error = 1'b1;
+                    end else begin
+                        // Replicate byte 16 times
+                        mem_resp_o.rdata = {16{mem[mem_req_i.addr]}};
+                        mem_resp_o.rvalid = 1'b1;
+                    end
+                end
+
+                MEM_LOAD_V128_16_SPLAT: begin
+                    if (!in_read_bounds(mem_req_i.addr, 2)) begin
+                        trap = TRAP_OUT_OF_BOUNDS;
+                        mem_resp_o.error = 1'b1;
+                    end else begin
+                        // Replicate 16-bit value 8 times
+                        logic [15:0] val16;
+                        val16 = {mem[mem_req_i.addr+1], mem[mem_req_i.addr]};
+                        mem_resp_o.rdata = {8{val16}};
+                        mem_resp_o.rvalid = 1'b1;
+                    end
+                end
+
+                MEM_LOAD_V128_32_SPLAT: begin
+                    if (!in_read_bounds(mem_req_i.addr, 4)) begin
+                        trap = TRAP_OUT_OF_BOUNDS;
+                        mem_resp_o.error = 1'b1;
+                    end else begin
+                        // Replicate 32-bit value 4 times
+                        logic [31:0] val32;
+                        val32 = {mem[mem_req_i.addr+3], mem[mem_req_i.addr+2],
+                                 mem[mem_req_i.addr+1], mem[mem_req_i.addr]};
+                        mem_resp_o.rdata = {4{val32}};
+                        mem_resp_o.rvalid = 1'b1;
+                    end
+                end
+
+                MEM_LOAD_V128_64_SPLAT: begin
+                    if (!in_read_bounds(mem_req_i.addr, 8)) begin
+                        trap = TRAP_OUT_OF_BOUNDS;
+                        mem_resp_o.error = 1'b1;
+                    end else begin
+                        // Replicate 64-bit value 2 times
+                        logic [63:0] val64;
+                        val64 = {mem[mem_req_i.addr+7], mem[mem_req_i.addr+6],
+                                 mem[mem_req_i.addr+5], mem[mem_req_i.addr+4],
+                                 mem[mem_req_i.addr+3], mem[mem_req_i.addr+2],
+                                 mem[mem_req_i.addr+1], mem[mem_req_i.addr]};
+                        mem_resp_o.rdata = {2{val64}};
+                        mem_resp_o.rvalid = 1'b1;
+                    end
+                end
+
+                // SIMD extend loads - load 8 bytes and sign/zero extend
+                MEM_LOAD_V128_8X8_S: begin
+                    if (!in_read_bounds(mem_req_i.addr, 8)) begin
+                        trap = TRAP_OUT_OF_BOUNDS;
+                        mem_resp_o.error = 1'b1;
+                    end else begin
+                        // Sign extend 8 bytes to 8 i16 lanes
+                        mem_resp_o.rdata = {{8{mem[mem_req_i.addr+7][7]}}, mem[mem_req_i.addr+7],
+                                            {8{mem[mem_req_i.addr+6][7]}}, mem[mem_req_i.addr+6],
+                                            {8{mem[mem_req_i.addr+5][7]}}, mem[mem_req_i.addr+5],
+                                            {8{mem[mem_req_i.addr+4][7]}}, mem[mem_req_i.addr+4],
+                                            {8{mem[mem_req_i.addr+3][7]}}, mem[mem_req_i.addr+3],
+                                            {8{mem[mem_req_i.addr+2][7]}}, mem[mem_req_i.addr+2],
+                                            {8{mem[mem_req_i.addr+1][7]}}, mem[mem_req_i.addr+1],
+                                            {8{mem[mem_req_i.addr][7]}},   mem[mem_req_i.addr]};
+                        mem_resp_o.rvalid = 1'b1;
+                    end
+                end
+
+                MEM_LOAD_V128_8X8_U: begin
+                    if (!in_read_bounds(mem_req_i.addr, 8)) begin
+                        trap = TRAP_OUT_OF_BOUNDS;
+                        mem_resp_o.error = 1'b1;
+                    end else begin
+                        // Zero extend 8 bytes to 8 i16 lanes
+                        mem_resp_o.rdata = {8'b0, mem[mem_req_i.addr+7],
+                                            8'b0, mem[mem_req_i.addr+6],
+                                            8'b0, mem[mem_req_i.addr+5],
+                                            8'b0, mem[mem_req_i.addr+4],
+                                            8'b0, mem[mem_req_i.addr+3],
+                                            8'b0, mem[mem_req_i.addr+2],
+                                            8'b0, mem[mem_req_i.addr+1],
+                                            8'b0, mem[mem_req_i.addr]};
+                        mem_resp_o.rvalid = 1'b1;
+                    end
+                end
+
+                MEM_LOAD_V128_16X4_S: begin
+                    if (!in_read_bounds(mem_req_i.addr, 8)) begin
+                        trap = TRAP_OUT_OF_BOUNDS;
+                        mem_resp_o.error = 1'b1;
+                    end else begin
+                        // Sign extend 4 i16 to 4 i32 lanes
+                        logic [15:0] w0, w1, w2, w3;
+                        w0 = {mem[mem_req_i.addr+1], mem[mem_req_i.addr]};
+                        w1 = {mem[mem_req_i.addr+3], mem[mem_req_i.addr+2]};
+                        w2 = {mem[mem_req_i.addr+5], mem[mem_req_i.addr+4]};
+                        w3 = {mem[mem_req_i.addr+7], mem[mem_req_i.addr+6]};
+                        mem_resp_o.rdata = {{16{w3[15]}}, w3, {16{w2[15]}}, w2,
+                                            {16{w1[15]}}, w1, {16{w0[15]}}, w0};
+                        mem_resp_o.rvalid = 1'b1;
+                    end
+                end
+
+                MEM_LOAD_V128_16X4_U: begin
+                    if (!in_read_bounds(mem_req_i.addr, 8)) begin
+                        trap = TRAP_OUT_OF_BOUNDS;
+                        mem_resp_o.error = 1'b1;
+                    end else begin
+                        // Zero extend 4 i16 to 4 i32 lanes
+                        mem_resp_o.rdata = {16'b0, mem[mem_req_i.addr+7], mem[mem_req_i.addr+6],
+                                            16'b0, mem[mem_req_i.addr+5], mem[mem_req_i.addr+4],
+                                            16'b0, mem[mem_req_i.addr+3], mem[mem_req_i.addr+2],
+                                            16'b0, mem[mem_req_i.addr+1], mem[mem_req_i.addr]};
+                        mem_resp_o.rvalid = 1'b1;
+                    end
+                end
+
+                MEM_LOAD_V128_32X2_S: begin
+                    if (!in_read_bounds(mem_req_i.addr, 8)) begin
+                        trap = TRAP_OUT_OF_BOUNDS;
+                        mem_resp_o.error = 1'b1;
+                    end else begin
+                        // Sign extend 2 i32 to 2 i64 lanes
+                        logic [31:0] d0, d1;
+                        d0 = {mem[mem_req_i.addr+3], mem[mem_req_i.addr+2],
+                              mem[mem_req_i.addr+1], mem[mem_req_i.addr]};
+                        d1 = {mem[mem_req_i.addr+7], mem[mem_req_i.addr+6],
+                              mem[mem_req_i.addr+5], mem[mem_req_i.addr+4]};
+                        mem_resp_o.rdata = {{32{d1[31]}}, d1, {32{d0[31]}}, d0};
+                        mem_resp_o.rvalid = 1'b1;
+                    end
+                end
+
+                MEM_LOAD_V128_32X2_U: begin
+                    if (!in_read_bounds(mem_req_i.addr, 8)) begin
+                        trap = TRAP_OUT_OF_BOUNDS;
+                        mem_resp_o.error = 1'b1;
+                    end else begin
+                        // Zero extend 2 i32 to 2 i64 lanes
+                        mem_resp_o.rdata = {32'b0, mem[mem_req_i.addr+7], mem[mem_req_i.addr+6],
+                                            mem[mem_req_i.addr+5], mem[mem_req_i.addr+4],
+                                            32'b0, mem[mem_req_i.addr+3], mem[mem_req_i.addr+2],
+                                            mem[mem_req_i.addr+1], mem[mem_req_i.addr]};
+                        mem_resp_o.rvalid = 1'b1;
+                    end
+                end
+
+                // SIMD zero loads - load 32/64 bits into low lane, zero high lanes
+                MEM_LOAD_V128_32_ZERO: begin
+                    if (!in_read_bounds(mem_req_i.addr, 4)) begin
+                        trap = TRAP_OUT_OF_BOUNDS;
+                        mem_resp_o.error = 1'b1;
+                    end else begin
+                        mem_resp_o.rdata = {96'b0, mem[mem_req_i.addr+3], mem[mem_req_i.addr+2],
+                                            mem[mem_req_i.addr+1], mem[mem_req_i.addr]};
+                        mem_resp_o.rvalid = 1'b1;
+                    end
+                end
+
+                MEM_LOAD_V128_64_ZERO: begin
+                    if (!in_read_bounds(mem_req_i.addr, 8)) begin
+                        trap = TRAP_OUT_OF_BOUNDS;
+                        mem_resp_o.error = 1'b1;
+                    end else begin
+                        mem_resp_o.rdata = {64'b0, mem[mem_req_i.addr+7], mem[mem_req_i.addr+6],
+                                            mem[mem_req_i.addr+5], mem[mem_req_i.addr+4],
+                                            mem[mem_req_i.addr+3], mem[mem_req_i.addr+2],
                                             mem[mem_req_i.addr+1], mem[mem_req_i.addr]};
                         mem_resp_o.rvalid = 1'b1;
                     end
@@ -252,14 +449,14 @@ module wasm_memory
                         mem_resp_o.error = 1'b1;
                     end else begin
                         case (mem_req_i.size)
-                            MEM_SIZE_1: mem_resp_o.rdata = {56'b0, mem[mem_req_i.addr]};
-                            MEM_SIZE_2: mem_resp_o.rdata = {48'b0, mem[mem_req_i.addr+1],
+                            MEM_SIZE_1: mem_resp_o.rdata = {120'b0, mem[mem_req_i.addr]};
+                            MEM_SIZE_2: mem_resp_o.rdata = {112'b0, mem[mem_req_i.addr+1],
                                                             mem[mem_req_i.addr]};
-                            MEM_SIZE_4: mem_resp_o.rdata = {32'b0, mem[mem_req_i.addr+3],
+                            MEM_SIZE_4: mem_resp_o.rdata = {96'b0, mem[mem_req_i.addr+3],
                                                             mem[mem_req_i.addr+2],
                                                             mem[mem_req_i.addr+1],
                                                             mem[mem_req_i.addr]};
-                            MEM_SIZE_8: mem_resp_o.rdata = {mem[mem_req_i.addr+7],
+                            MEM_SIZE_8: mem_resp_o.rdata = {64'b0, mem[mem_req_i.addr+7],
                                                             mem[mem_req_i.addr+6],
                                                             mem[mem_req_i.addr+5],
                                                             mem[mem_req_i.addr+4],
@@ -267,6 +464,23 @@ module wasm_memory
                                                             mem[mem_req_i.addr+2],
                                                             mem[mem_req_i.addr+1],
                                                             mem[mem_req_i.addr]};
+                            MEM_SIZE_16: mem_resp_o.rdata = {mem[mem_req_i.addr+15],
+                                                             mem[mem_req_i.addr+14],
+                                                             mem[mem_req_i.addr+13],
+                                                             mem[mem_req_i.addr+12],
+                                                             mem[mem_req_i.addr+11],
+                                                             mem[mem_req_i.addr+10],
+                                                             mem[mem_req_i.addr+9],
+                                                             mem[mem_req_i.addr+8],
+                                                             mem[mem_req_i.addr+7],
+                                                             mem[mem_req_i.addr+6],
+                                                             mem[mem_req_i.addr+5],
+                                                             mem[mem_req_i.addr+4],
+                                                             mem[mem_req_i.addr+3],
+                                                             mem[mem_req_i.addr+2],
+                                                             mem[mem_req_i.addr+1],
+                                                             mem[mem_req_i.addr]};
+                            default: mem_resp_o.rdata = 128'b0;
                         endcase
                         mem_resp_o.rvalid = 1'b1;
                     end
@@ -352,6 +566,31 @@ module wasm_memory
                             mem[mem_req_i.addr+6] <= mem_req_i.wdata[55:48];
                             mem[mem_req_i.addr+7] <= mem_req_i.wdata[63:56];
                         end
+                    end
+
+                    MEM_SIZE_16: begin
+                        if (in_bounds(mem_req_i.addr, 16)) begin
+                            mem[mem_req_i.addr]    <= mem_req_i.wdata[7:0];
+                            mem[mem_req_i.addr+1]  <= mem_req_i.wdata[15:8];
+                            mem[mem_req_i.addr+2]  <= mem_req_i.wdata[23:16];
+                            mem[mem_req_i.addr+3]  <= mem_req_i.wdata[31:24];
+                            mem[mem_req_i.addr+4]  <= mem_req_i.wdata[39:32];
+                            mem[mem_req_i.addr+5]  <= mem_req_i.wdata[47:40];
+                            mem[mem_req_i.addr+6]  <= mem_req_i.wdata[55:48];
+                            mem[mem_req_i.addr+7]  <= mem_req_i.wdata[63:56];
+                            mem[mem_req_i.addr+8]  <= mem_req_i.wdata[71:64];
+                            mem[mem_req_i.addr+9]  <= mem_req_i.wdata[79:72];
+                            mem[mem_req_i.addr+10] <= mem_req_i.wdata[87:80];
+                            mem[mem_req_i.addr+11] <= mem_req_i.wdata[95:88];
+                            mem[mem_req_i.addr+12] <= mem_req_i.wdata[103:96];
+                            mem[mem_req_i.addr+13] <= mem_req_i.wdata[111:104];
+                            mem[mem_req_i.addr+14] <= mem_req_i.wdata[119:112];
+                            mem[mem_req_i.addr+15] <= mem_req_i.wdata[127:120];
+                        end
+                    end
+
+                    default: begin
+                        // Do nothing for unknown sizes
                     end
                 endcase
             end

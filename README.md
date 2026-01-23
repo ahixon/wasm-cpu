@@ -1,6 +1,6 @@
 # wasm-cpu
 
-A hardware WebAssembly processor implemented in SystemVerilog. Currently supports WebAssembly v1. v2 and v3 support are in progress.
+A hardware WebAssembly processor implemented in SystemVerilog. Currently supports WebAssembly v2. v3 support is in progress.
 
 [Discord](https://discord.gg/vJ52qVu3)
 
@@ -46,9 +46,9 @@ Implemented:
 - Reference branching (br_on_null, br_on_non_null)
 - Element segment operations (table.init, elem.drop)
 - Bulk memory operations (memory.init, memory.copy, memory.fill)
+- SIMD (128-bit vector operations) - v2
 
 Not yet implemented (skipped in tests):
-- SIMD (128-bit vector operations) - v2
 - Typed function references (call_ref, return_call_ref) - v3
 - Exception handling - v3
 - Multiple memories (multi-memory proposal) - v3

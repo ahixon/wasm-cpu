@@ -207,8 +207,8 @@ module wasm_cpu
 
     // Code memory
     logic [7:0] code_mem [0:CODE_SIZE-1];
-    logic [7:0] instr_bytes [0:15];
-    logic [3:0] bytes_available;
+    logic [7:0] instr_bytes [0:19];  // 20 bytes for v128.const support
+    logic [4:0] bytes_available;  // 5 bits for values up to 19
 
     // Function to compute LEB128 byte length by checking continuation bits
     // Returns the number of bytes in a LEB128 sequence starting at addr
@@ -232,12 +232,12 @@ module wasm_cpu
     endfunction
 
     // Function to compute blocktype length
-    // Blocktype is: 0x40 (empty), 0x7F-0x7C (valtype), or s33 LEB128 (type index)
+    // Blocktype is: 0x40 (empty), 0x7F-0x7B (valtype), or s33 LEB128 (type index)
     function automatic logic [3:0] blocktype_len(input logic [31:0] addr);
         logic [7:0] bt;
         bt = code_mem[addr];
-        // Single-byte blocktypes: 0x40 (empty) or 0x7F-0x7C (value types)
-        if (bt == 8'h40 || (bt >= 8'h7C && bt <= 8'h7F))
+        // Single-byte blocktypes: 0x40 (empty) or 0x7F-0x7B (value types including v128)
+        if (bt == 8'h40 || (bt >= 8'h7B && bt <= 8'h7F))
             return 4'd1;
         else
             // s33 type index - use LEB128 length
@@ -521,12 +521,12 @@ module wasm_cpu
     logic        mem_rd_en;
     logic [31:0] mem_rd_addr;
     mem_op_t     mem_rd_op;
-    logic [63:0] mem_rd_data;
+    logic [127:0] mem_rd_data;
     logic        mem_rd_valid;
     logic        mem_wr_en;
     logic [31:0] mem_wr_addr;
     mem_op_t     mem_wr_op;
-    logic [63:0] mem_wr_data;
+    logic [127:0] mem_wr_data;
     logic        mem_wr_valid;
     logic        mem_grow_en;
     logic [31:0] mem_grow_pages;
@@ -688,6 +688,35 @@ module wasm_cpu
     );
 
     // =========================================================================
+    // SIMD ALU (v128)
+    // =========================================================================
+    logic         alu_v128_valid_in;
+    logic [8:0]   alu_v128_op;
+    logic [127:0] alu_v128_a, alu_v128_b, alu_v128_c;
+    logic [7:0]   alu_v128_lane_idx;
+    logic         alu_v128_valid_out;
+    logic [127:0] alu_v128_result;
+    logic [63:0]  alu_v128_scalar_result;
+    logic         alu_v128_is_scalar;
+    trap_t        alu_v128_trap;
+
+    wasm_alu_v128 alu_v128 (
+        .clk(clk),
+        .rst_n(rst_n),
+        .valid_in(alu_v128_valid_in),
+        .op(alu_v128_op),
+        .operand_a(alu_v128_a),
+        .operand_b(alu_v128_b),
+        .operand_c(alu_v128_c),
+        .lane_idx(alu_v128_lane_idx),
+        .valid_out(alu_v128_valid_out),
+        .result(alu_v128_result),
+        .scalar_result(alu_v128_scalar_result),
+        .is_scalar(alu_v128_is_scalar),
+        .trap(alu_v128_trap)
+    );
+
+    // =========================================================================
     // FPU Units
     // =========================================================================
     logic        fpu_f32_valid_in;
@@ -754,10 +783,17 @@ module wasm_cpu
     // =========================================================================
     // Decoder
     // =========================================================================
+    // Decoder is active during decode, and also during scan states
+    // (scan states need decoder.instr_length for 0xFC/0xFD prefix instructions)
+    logic decoder_valid_in;
+    assign decoder_valid_in = (state == STATE_DECODE) ||
+                              (state == STATE_SCAN_ELSE) ||
+                              (state == STATE_SCAN_END);
+
     wasm_decoder decoder (
         .clk(clk),
         .rst_n(rst_n),
-        .valid_in(state == STATE_DECODE),
+        .valid_in(decoder_valid_in),
         .pc(pc),
         .instr_bytes(instr_bytes),
         .bytes_available(bytes_available),
@@ -775,10 +811,10 @@ module wasm_cpu
         end
     end
 
-    // Fetch instruction bytes
+    // Fetch instruction bytes (20 bytes for v128.const support)
     always_comb begin
-        bytes_available = 4'd15;
-        for (int i = 0; i < 16; i++) begin
+        bytes_available = 5'd19;
+        for (int i = 0; i < 20; i++) begin
             if (pc + i < CODE_SIZE) begin
                 instr_bytes[i] = code_mem[pc + i];
             end else begin
@@ -915,7 +951,7 @@ module wasm_cpu
     logic [31:0] effective_addr;
     logic [32:0] effective_addr_full;  // 33-bit to detect overflow
     logic        effective_addr_overflow;
-    logic [63:0] exec_result;
+    logic [127:0] exec_result;
     valtype_t    exec_result_type;
     logic        exec_trap_flag;
     trap_t       exec_trap;
@@ -939,7 +975,7 @@ module wasm_cpu
             capture_result_count <= 8'h0;
             saved_decoded <= '0;
             saved_next_pc <= 32'h0;
-            exec_result <= 64'h0;
+            exec_result <= 128'h0;
             exec_result_type <= TYPE_I32;
             scan_depth <= 8'h0;
             scan_for_else <= 1'b0;
@@ -1002,6 +1038,7 @@ module wasm_cpu
             alu_i64_valid_in <= 1'b0;
             fpu_f32_valid_in <= 1'b0;
             fpu_f64_valid_in <= 1'b0;
+            alu_v128_valid_in <= 1'b0;
             conv_valid_in <= 1'b0;
             conv_sub_op <= 8'h0;
             result_valid <= 1'b0;
@@ -1072,7 +1109,7 @@ module wasm_cpu
                             // Otherwise = type index, look up in type_table
                             if (saved_decoded.immediate == 64'hFFFFFFFF)
                                 label_push_data.arity <= 8'h0;
-                            else if (saved_decoded.immediate >= 64'h7C && saved_decoded.immediate <= 64'h7F)
+                            else if (saved_decoded.immediate >= 64'h7B && saved_decoded.immediate <= 64'h7F)
                                 label_push_data.arity <= 8'h1;
                             else
                                 label_push_data.arity <= type_table[saved_decoded.immediate[7:0]].result_count;
@@ -1103,7 +1140,7 @@ module wasm_cpu
                                 // Determine if block arity from block type
                                 if (saved_decoded.immediate == 64'hFFFFFFFF)
                                     label_push_data.arity <= 8'h0;
-                                else if (saved_decoded.immediate >= 64'h7C && saved_decoded.immediate <= 64'h7F)
+                                else if (saved_decoded.immediate >= 64'h7B && saved_decoded.immediate <= 64'h7F)
                                     label_push_data.arity <= 8'h1;
                                 else
                                     label_push_data.arity <= type_table[saved_decoded.immediate[7:0]].result_count;
@@ -2899,6 +2936,543 @@ module wasm_cpu
                             endcase
                         end
 
+                        // SIMD opcodes (0xFD prefix)
+                        OP_PREFIX_FD: begin
+                            // immediate[8:0] contains the sub-opcode
+                            case (saved_decoded.immediate[8:0])
+                                // v128.load - load 16 bytes from memory
+                                FD_V128_LOAD: begin
+                                    stack_pop_en <= 1'b1;
+                                    effective_addr_full = {1'b0, operand_a.value[31:0]} + {1'b0, saved_decoded.immediate2[31:0]};
+                                    effective_addr_overflow = effective_addr_full[32];
+                                    effective_addr = effective_addr_full[31:0];
+                                    if (effective_addr_overflow) begin
+                                        trap_code <= TRAP_OUT_OF_BOUNDS;
+                                        state <= STATE_TRAP;
+                                    end else begin
+                                        mem_rd_en <= 1'b1;
+                                        mem_rd_addr <= effective_addr;
+                                        mem_rd_op <= MEM_LOAD_V128;
+                                        state <= STATE_MEMORY;
+                                    end
+                                end
+
+                                // v128.store - store 16 bytes to memory
+                                FD_V128_STORE: begin
+                                    stack_multi_pop_en <= 1'b1;
+                                    stack_multi_pop_count <= 8'd2;
+                                    effective_addr_full = {1'b0, operand_b.value[31:0]} + {1'b0, saved_decoded.immediate2[31:0]};
+                                    effective_addr_overflow = effective_addr_full[32];
+                                    effective_addr = effective_addr_full[31:0];
+                                    if (effective_addr_overflow) begin
+                                        trap_code <= TRAP_OUT_OF_BOUNDS;
+                                        state <= STATE_TRAP;
+                                    end else begin
+                                        mem_wr_en <= 1'b1;
+                                        mem_wr_addr <= effective_addr;
+                                        mem_wr_op <= MEM_STORE_V128;
+                                        mem_wr_data <= operand_a.value;  // v128 value on TOS
+                                        state <= STATE_MEMORY;
+                                    end
+                                end
+
+                                // v128 extended load operations
+                                FD_V128_LOAD8X8_S, FD_V128_LOAD8X8_U,
+                                FD_V128_LOAD16X4_S, FD_V128_LOAD16X4_U,
+                                FD_V128_LOAD32X2_S, FD_V128_LOAD32X2_U: begin
+                                    stack_pop_en <= 1'b1;
+                                    effective_addr_full = {1'b0, operand_a.value[31:0]} + {1'b0, saved_decoded.immediate2[31:0]};
+                                    effective_addr_overflow = effective_addr_full[32];
+                                    effective_addr = effective_addr_full[31:0];
+                                    if (effective_addr_overflow) begin
+                                        trap_code <= TRAP_OUT_OF_BOUNDS;
+                                        state <= STATE_TRAP;
+                                    end else begin
+                                        mem_rd_en <= 1'b1;
+                                        mem_rd_addr <= effective_addr;
+                                        case (saved_decoded.immediate[8:0])
+                                            FD_V128_LOAD8X8_S:  mem_rd_op <= MEM_LOAD_V128_8X8_S;
+                                            FD_V128_LOAD8X8_U:  mem_rd_op <= MEM_LOAD_V128_8X8_U;
+                                            FD_V128_LOAD16X4_S: mem_rd_op <= MEM_LOAD_V128_16X4_S;
+                                            FD_V128_LOAD16X4_U: mem_rd_op <= MEM_LOAD_V128_16X4_U;
+                                            FD_V128_LOAD32X2_S: mem_rd_op <= MEM_LOAD_V128_32X2_S;
+                                            FD_V128_LOAD32X2_U: mem_rd_op <= MEM_LOAD_V128_32X2_U;
+                                            default: mem_rd_op <= MEM_LOAD_V128;
+                                        endcase
+                                        state <= STATE_MEMORY;
+                                    end
+                                end
+
+                                // v128 splat load operations
+                                FD_V128_LOAD8_SPLAT, FD_V128_LOAD16_SPLAT,
+                                FD_V128_LOAD32_SPLAT, FD_V128_LOAD64_SPLAT: begin
+                                    stack_pop_en <= 1'b1;
+                                    effective_addr_full = {1'b0, operand_a.value[31:0]} + {1'b0, saved_decoded.immediate2[31:0]};
+                                    effective_addr_overflow = effective_addr_full[32];
+                                    effective_addr = effective_addr_full[31:0];
+                                    if (effective_addr_overflow) begin
+                                        trap_code <= TRAP_OUT_OF_BOUNDS;
+                                        state <= STATE_TRAP;
+                                    end else begin
+                                        mem_rd_en <= 1'b1;
+                                        mem_rd_addr <= effective_addr;
+                                        case (saved_decoded.immediate[8:0])
+                                            FD_V128_LOAD8_SPLAT:  mem_rd_op <= MEM_LOAD_V128_8_SPLAT;
+                                            FD_V128_LOAD16_SPLAT: mem_rd_op <= MEM_LOAD_V128_16_SPLAT;
+                                            FD_V128_LOAD32_SPLAT: mem_rd_op <= MEM_LOAD_V128_32_SPLAT;
+                                            FD_V128_LOAD64_SPLAT: mem_rd_op <= MEM_LOAD_V128_64_SPLAT;
+                                            default: mem_rd_op <= MEM_LOAD_V128;
+                                        endcase
+                                        state <= STATE_MEMORY;
+                                    end
+                                end
+
+                                // v128 zero-extending loads
+                                FD_V128_LOAD32_ZERO, FD_V128_LOAD64_ZERO: begin
+                                    stack_pop_en <= 1'b1;
+                                    effective_addr_full = {1'b0, operand_a.value[31:0]} + {1'b0, saved_decoded.immediate2[31:0]};
+                                    effective_addr_overflow = effective_addr_full[32];
+                                    effective_addr = effective_addr_full[31:0];
+                                    if (effective_addr_overflow) begin
+                                        trap_code <= TRAP_OUT_OF_BOUNDS;
+                                        state <= STATE_TRAP;
+                                    end else begin
+                                        mem_rd_en <= 1'b1;
+                                        mem_rd_addr <= effective_addr;
+                                        mem_rd_op <= (saved_decoded.immediate[8:0] == FD_V128_LOAD32_ZERO) ?
+                                                    MEM_LOAD_V128_32_ZERO : MEM_LOAD_V128_64_ZERO;
+                                        state <= STATE_MEMORY;
+                                    end
+                                end
+
+                                // v128.const - push 128-bit constant
+                                FD_V128_CONST: begin
+                                    stack_push_en <= 1'b1;
+                                    stack_push_data.vtype <= TYPE_V128;
+                                    stack_push_data.value <= saved_decoded.immediate2;
+                                    pc <= saved_next_pc;
+                                    state <= STATE_FETCH;
+                                end
+
+                                // i8x16.shuffle - reorder lanes using immediate indices
+                                FD_I8X16_SHUFFLE: begin
+                                    stack_multi_pop_en <= 1'b1;  // Pop both operands
+                                    stack_multi_pop_count <= 8'd2;
+                                    alu_v128_valid_in <= 1'b1;
+                                    alu_v128_op <= FD_I8X16_SHUFFLE;
+                                    alu_v128_a <= operand_b.value;  // First vector (TOS-1)
+                                    alu_v128_b <= operand_a.value;  // Second vector (TOS)
+                                    alu_v128_c <= saved_decoded.immediate2;  // Shuffle indices (now in immediate2)
+                                    state <= STATE_WRITEBACK;
+                                end
+
+                                // i8x16.swizzle - reorder lanes using runtime indices
+                                FD_I8X16_SWIZZLE: begin
+                                    stack_multi_pop_en <= 1'b1;  // Pop both operands
+                                    stack_multi_pop_count <= 8'd2;
+                                    alu_v128_valid_in <= 1'b1;
+                                    alu_v128_op <= saved_decoded.immediate[8:0];
+                                    alu_v128_a <= operand_b.value;  // Vector (TOS-1)
+                                    alu_v128_b <= operand_a.value;  // Indices (TOS)
+                                    state <= STATE_WRITEBACK;
+                                end
+
+                                // Splat operations - create v128 from scalar
+                                FD_I8X16_SPLAT, FD_I16X8_SPLAT, FD_I32X4_SPLAT,
+                                FD_I64X2_SPLAT, FD_F32X4_SPLAT, FD_F64X2_SPLAT: begin
+                                    stack_pop_en <= 1'b1;
+                                    alu_v128_valid_in <= 1'b1;
+                                    alu_v128_op <= saved_decoded.immediate[8:0];
+                                    alu_v128_a <= operand_a.value;
+                                    state <= STATE_WRITEBACK;
+                                end
+
+                                // Extract lane operations - extract scalar from v128
+                                // Decoder puts lane index in immediate[16:9]
+                                FD_I8X16_EXTRACT_LANE_S, FD_I8X16_EXTRACT_LANE_U,
+                                FD_I16X8_EXTRACT_LANE_S, FD_I16X8_EXTRACT_LANE_U,
+                                FD_I32X4_EXTRACT_LANE, FD_I64X2_EXTRACT_LANE,
+                                FD_F32X4_EXTRACT_LANE, FD_F64X2_EXTRACT_LANE: begin
+                                    stack_pop_en <= 1'b1;
+                                    alu_v128_valid_in <= 1'b1;
+                                    alu_v128_op <= saved_decoded.immediate[8:0];
+                                    alu_v128_a <= operand_a.value;
+                                    alu_v128_lane_idx <= saved_decoded.immediate[16:9];
+                                    state <= STATE_WRITEBACK;
+                                end
+
+                                // Replace lane operations - replace scalar in v128
+                                // Decoder puts lane index in immediate[16:9]
+                                FD_I8X16_REPLACE_LANE, FD_I16X8_REPLACE_LANE,
+                                FD_I32X4_REPLACE_LANE, FD_I64X2_REPLACE_LANE,
+                                FD_F32X4_REPLACE_LANE, FD_F64X2_REPLACE_LANE: begin
+                                    stack_multi_pop_en <= 1'b1;  // Pop both operands
+                                    stack_multi_pop_count <= 8'd2;
+                                    alu_v128_valid_in <= 1'b1;
+                                    alu_v128_op <= saved_decoded.immediate[8:0];
+                                    alu_v128_a <= operand_b.value;  // v128 (TOS-1)
+                                    alu_v128_b <= operand_a.value;  // scalar (TOS)
+                                    alu_v128_lane_idx <= saved_decoded.immediate[16:9];
+                                    state <= STATE_WRITEBACK;
+                                end
+
+                                // v128 bitwise operations (2 operands)
+                                FD_V128_AND, FD_V128_ANDNOT, FD_V128_OR, FD_V128_XOR: begin
+                                    stack_multi_pop_en <= 1'b1;  // Pop both operands
+                                    stack_multi_pop_count <= 8'd2;
+                                    alu_v128_valid_in <= 1'b1;
+                                    alu_v128_op <= saved_decoded.immediate[8:0];
+                                    alu_v128_a <= operand_b.value;
+                                    alu_v128_b <= operand_a.value;
+                                    state <= STATE_WRITEBACK;
+                                end
+
+                                // v128.not (1 operand)
+                                FD_V128_NOT: begin
+                                    stack_pop_en <= 1'b1;
+                                    alu_v128_valid_in <= 1'b1;
+                                    alu_v128_op <= saved_decoded.immediate[8:0];
+                                    alu_v128_a <= operand_a.value;
+                                    state <= STATE_WRITEBACK;
+                                end
+
+                                // v128.bitselect (3 operands)
+                                FD_V128_BITSELECT: begin
+                                    stack_multi_pop_en <= 1'b1;
+                                    stack_multi_pop_count <= 8'd2;
+                                    alu_v128_valid_in <= 1'b1;
+                                    alu_v128_op <= saved_decoded.immediate[8:0];
+                                    alu_v128_a <= operand_c.value;  // a (TOS-2)
+                                    alu_v128_b <= operand_b.value;  // b (TOS-1)
+                                    alu_v128_c <= operand_a.value;  // mask (TOS)
+                                    state <= STATE_WRITEBACK;
+                                end
+
+                                // v128.any_true - returns i32
+                                FD_V128_ANY_TRUE: begin
+                                    stack_pop_en <= 1'b1;
+                                    alu_v128_valid_in <= 1'b1;
+                                    alu_v128_op <= saved_decoded.immediate[8:0];
+                                    alu_v128_a <= operand_a.value;
+                                    state <= STATE_WRITEBACK;
+                                end
+
+                                // Unary integer operations (abs, neg, popcnt, etc.)
+                                FD_I8X16_ABS, FD_I8X16_NEG, FD_I8X16_POPCNT,
+                                FD_I16X8_ABS, FD_I16X8_NEG,
+                                FD_I32X4_ABS, FD_I32X4_NEG,
+                                FD_I64X2_ABS, FD_I64X2_NEG: begin
+                                    stack_pop_en <= 1'b1;
+                                    alu_v128_valid_in <= 1'b1;
+                                    alu_v128_op <= saved_decoded.immediate[8:0];
+                                    alu_v128_a <= operand_a.value;
+                                    state <= STATE_WRITEBACK;
+                                end
+
+                                // all_true, bitmask - returns i32
+                                FD_I8X16_ALL_TRUE, FD_I8X16_BITMASK,
+                                FD_I16X8_ALL_TRUE, FD_I16X8_BITMASK,
+                                FD_I32X4_ALL_TRUE, FD_I32X4_BITMASK,
+                                FD_I64X2_ALL_TRUE, FD_I64X2_BITMASK: begin
+                                    stack_pop_en <= 1'b1;
+                                    alu_v128_valid_in <= 1'b1;
+                                    alu_v128_op <= saved_decoded.immediate[8:0];
+                                    alu_v128_a <= operand_a.value;
+                                    state <= STATE_WRITEBACK;
+                                end
+
+                                // Binary integer operations (add, sub, mul, min, max, avgr, etc.)
+                                FD_I8X16_ADD, FD_I8X16_ADD_SAT_S, FD_I8X16_ADD_SAT_U,
+                                FD_I8X16_SUB, FD_I8X16_SUB_SAT_S, FD_I8X16_SUB_SAT_U,
+                                FD_I8X16_MIN_S, FD_I8X16_MIN_U, FD_I8X16_MAX_S, FD_I8X16_MAX_U,
+                                FD_I8X16_AVGR_U,
+                                FD_I16X8_ADD, FD_I16X8_ADD_SAT_S, FD_I16X8_ADD_SAT_U,
+                                FD_I16X8_SUB, FD_I16X8_SUB_SAT_S, FD_I16X8_SUB_SAT_U,
+                                FD_I16X8_MUL, FD_I16X8_MIN_S, FD_I16X8_MIN_U,
+                                FD_I16X8_MAX_S, FD_I16X8_MAX_U, FD_I16X8_AVGR_U,
+                                FD_I16X8_Q15MULR_SAT_S,
+                                FD_I32X4_ADD, FD_I32X4_SUB, FD_I32X4_MUL,
+                                FD_I32X4_MIN_S, FD_I32X4_MIN_U, FD_I32X4_MAX_S, FD_I32X4_MAX_U,
+                                FD_I32X4_DOT_I16X8_S,
+                                FD_I64X2_ADD, FD_I64X2_SUB, FD_I64X2_MUL: begin
+                                    stack_multi_pop_en <= 1'b1;  // Pop both operands
+                                    stack_multi_pop_count <= 8'd2;
+                                    alu_v128_valid_in <= 1'b1;
+                                    alu_v128_op <= saved_decoded.immediate[8:0];
+                                    alu_v128_a <= operand_b.value;
+                                    alu_v128_b <= operand_a.value;
+                                    state <= STATE_WRITEBACK;
+                                end
+
+                                // Shift operations (shift amount is scalar i32 on TOS)
+                                FD_I8X16_SHL, FD_I8X16_SHR_S, FD_I8X16_SHR_U,
+                                FD_I16X8_SHL, FD_I16X8_SHR_S, FD_I16X8_SHR_U,
+                                FD_I32X4_SHL, FD_I32X4_SHR_S, FD_I32X4_SHR_U,
+                                FD_I64X2_SHL, FD_I64X2_SHR_S, FD_I64X2_SHR_U: begin
+                                    stack_multi_pop_en <= 1'b1;  // Pop both operands (v128 + shift count)
+                                    stack_multi_pop_count <= 8'd2;
+                                    alu_v128_valid_in <= 1'b1;
+                                    alu_v128_op <= saved_decoded.immediate[8:0];
+                                    alu_v128_a <= operand_b.value;  // v128 (TOS-1)
+                                    alu_v128_b <= operand_a.value;  // shift amount (TOS)
+                                    state <= STATE_WRITEBACK;
+                                end
+
+                                // Comparison operations (return v128 with all-ones/zeros lanes)
+                                FD_I8X16_EQ, FD_I8X16_NE,
+                                FD_I8X16_LT_S, FD_I8X16_LT_U, FD_I8X16_GT_S, FD_I8X16_GT_U,
+                                FD_I8X16_LE_S, FD_I8X16_LE_U, FD_I8X16_GE_S, FD_I8X16_GE_U,
+                                FD_I16X8_EQ, FD_I16X8_NE,
+                                FD_I16X8_LT_S, FD_I16X8_LT_U, FD_I16X8_GT_S, FD_I16X8_GT_U,
+                                FD_I16X8_LE_S, FD_I16X8_LE_U, FD_I16X8_GE_S, FD_I16X8_GE_U,
+                                FD_I32X4_EQ, FD_I32X4_NE,
+                                FD_I32X4_LT_S, FD_I32X4_LT_U, FD_I32X4_GT_S, FD_I32X4_GT_U,
+                                FD_I32X4_LE_S, FD_I32X4_LE_U, FD_I32X4_GE_S, FD_I32X4_GE_U,
+                                FD_I64X2_EQ, FD_I64X2_NE,
+                                FD_I64X2_LT_S, FD_I64X2_GT_S, FD_I64X2_LE_S, FD_I64X2_GE_S,
+                                FD_F32X4_EQ, FD_F32X4_NE, FD_F32X4_LT, FD_F32X4_GT,
+                                FD_F32X4_LE, FD_F32X4_GE,
+                                FD_F64X2_EQ, FD_F64X2_NE, FD_F64X2_LT, FD_F64X2_GT,
+                                FD_F64X2_LE, FD_F64X2_GE: begin
+                                    stack_multi_pop_en <= 1'b1;  // Pop both operands
+                                    stack_multi_pop_count <= 8'd2;
+                                    alu_v128_valid_in <= 1'b1;
+                                    alu_v128_op <= saved_decoded.immediate[8:0];
+                                    alu_v128_a <= operand_b.value;
+                                    alu_v128_b <= operand_a.value;
+                                    state <= STATE_WRITEBACK;
+                                end
+
+                                // Narrow operations (2 v128 -> 1 v128)
+                                FD_I8X16_NARROW_I16X8_S, FD_I8X16_NARROW_I16X8_U,
+                                FD_I16X8_NARROW_I32X4_S, FD_I16X8_NARROW_I32X4_U: begin
+                                    stack_multi_pop_en <= 1'b1;  // Pop both operands
+                                    stack_multi_pop_count <= 8'd2;
+                                    alu_v128_valid_in <= 1'b1;
+                                    alu_v128_op <= saved_decoded.immediate[8:0];
+                                    alu_v128_a <= operand_b.value;
+                                    alu_v128_b <= operand_a.value;
+                                    state <= STATE_WRITEBACK;
+                                end
+
+                                // Extend operations (1 v128 -> 1 v128)
+                                FD_I16X8_EXTEND_LOW_I8X16_S, FD_I16X8_EXTEND_HIGH_I8X16_S,
+                                FD_I16X8_EXTEND_LOW_I8X16_U, FD_I16X8_EXTEND_HIGH_I8X16_U,
+                                FD_I32X4_EXTEND_LOW_I16X8_S, FD_I32X4_EXTEND_HIGH_I16X8_S,
+                                FD_I32X4_EXTEND_LOW_I16X8_U, FD_I32X4_EXTEND_HIGH_I16X8_U,
+                                FD_I64X2_EXTEND_LOW_I32X4_S, FD_I64X2_EXTEND_HIGH_I32X4_S,
+                                FD_I64X2_EXTEND_LOW_I32X4_U, FD_I64X2_EXTEND_HIGH_I32X4_U: begin
+                                    stack_pop_en <= 1'b1;
+                                    alu_v128_valid_in <= 1'b1;
+                                    alu_v128_op <= saved_decoded.immediate[8:0];
+                                    alu_v128_a <= operand_a.value;
+                                    state <= STATE_WRITEBACK;
+                                end
+
+                                // Extended multiply operations (2 v128 -> 1 v128)
+                                FD_I16X8_EXTMUL_LOW_I8X16_S, FD_I16X8_EXTMUL_HIGH_I8X16_S,
+                                FD_I16X8_EXTMUL_LOW_I8X16_U, FD_I16X8_EXTMUL_HIGH_I8X16_U,
+                                FD_I32X4_EXTMUL_LOW_I16X8_S, FD_I32X4_EXTMUL_HIGH_I16X8_S,
+                                FD_I32X4_EXTMUL_LOW_I16X8_U, FD_I32X4_EXTMUL_HIGH_I16X8_U,
+                                FD_I64X2_EXTMUL_LOW_I32X4_S, FD_I64X2_EXTMUL_HIGH_I32X4_S,
+                                FD_I64X2_EXTMUL_LOW_I32X4_U, FD_I64X2_EXTMUL_HIGH_I32X4_U: begin
+                                    stack_multi_pop_en <= 1'b1;  // Pop both operands
+                                    stack_multi_pop_count <= 8'd2;
+                                    alu_v128_valid_in <= 1'b1;
+                                    alu_v128_op <= saved_decoded.immediate[8:0];
+                                    alu_v128_a <= operand_b.value;
+                                    alu_v128_b <= operand_a.value;
+                                    state <= STATE_WRITEBACK;
+                                end
+
+                                // Extended pairwise addition (1 v128 -> 1 v128)
+                                FD_I16X8_EXTADD_PAIRWISE_I8X16_S, FD_I16X8_EXTADD_PAIRWISE_I8X16_U,
+                                FD_I32X4_EXTADD_PAIRWISE_I16X8_S, FD_I32X4_EXTADD_PAIRWISE_I16X8_U: begin
+                                    stack_pop_en <= 1'b1;
+                                    alu_v128_valid_in <= 1'b1;
+                                    alu_v128_op <= saved_decoded.immediate[8:0];
+                                    alu_v128_a <= operand_a.value;
+                                    state <= STATE_WRITEBACK;
+                                end
+
+                                // Floating point unary operations
+                                FD_F32X4_ABS, FD_F32X4_NEG, FD_F32X4_SQRT,
+                                FD_F32X4_CEIL, FD_F32X4_FLOOR, FD_F32X4_TRUNC, FD_F32X4_NEAREST,
+                                FD_F64X2_ABS, FD_F64X2_NEG, FD_F64X2_SQRT,
+                                FD_F64X2_CEIL, FD_F64X2_FLOOR, FD_F64X2_TRUNC, FD_F64X2_NEAREST: begin
+                                    stack_pop_en <= 1'b1;
+                                    alu_v128_valid_in <= 1'b1;
+                                    alu_v128_op <= saved_decoded.immediate[8:0];
+                                    alu_v128_a <= operand_a.value;
+                                    state <= STATE_WRITEBACK;
+                                end
+
+                                // Floating point binary operations
+                                FD_F32X4_ADD, FD_F32X4_SUB, FD_F32X4_MUL, FD_F32X4_DIV,
+                                FD_F32X4_MIN, FD_F32X4_MAX, FD_F32X4_PMIN, FD_F32X4_PMAX,
+                                FD_F64X2_ADD, FD_F64X2_SUB, FD_F64X2_MUL, FD_F64X2_DIV,
+                                FD_F64X2_MIN, FD_F64X2_MAX, FD_F64X2_PMIN, FD_F64X2_PMAX: begin
+                                    stack_multi_pop_en <= 1'b1;  // Pop both operands
+                                    stack_multi_pop_count <= 8'd2;
+                                    alu_v128_valid_in <= 1'b1;
+                                    alu_v128_op <= saved_decoded.immediate[8:0];
+                                    alu_v128_a <= operand_b.value;
+                                    alu_v128_b <= operand_a.value;
+                                    state <= STATE_WRITEBACK;
+                                end
+
+                                // Conversion operations
+                                FD_I32X4_TRUNC_SAT_F32X4_S, FD_I32X4_TRUNC_SAT_F32X4_U,
+                                FD_F32X4_CONVERT_I32X4_S, FD_F32X4_CONVERT_I32X4_U,
+                                FD_I32X4_TRUNC_SAT_F64X2_S_ZERO, FD_I32X4_TRUNC_SAT_F64X2_U_ZERO,
+                                FD_F64X2_CONVERT_LOW_I32X4_S, FD_F64X2_CONVERT_LOW_I32X4_U,
+                                FD_F32X4_DEMOTE_F64X2_ZERO, FD_F64X2_PROMOTE_LOW_F32X4: begin
+                                    stack_pop_en <= 1'b1;
+                                    alu_v128_valid_in <= 1'b1;
+                                    alu_v128_op <= saved_decoded.immediate[8:0];
+                                    alu_v128_a <= operand_a.value;
+                                    state <= STATE_WRITEBACK;
+                                end
+
+                                // Relaxed SIMD - unary conversion operations
+                                FD_I32X4_RELAXED_TRUNC_F32X4_S, FD_I32X4_RELAXED_TRUNC_F32X4_U,
+                                FD_I32X4_RELAXED_TRUNC_F64X2_S_ZERO, FD_I32X4_RELAXED_TRUNC_F64X2_U_ZERO: begin
+                                    stack_pop_en <= 1'b1;
+                                    alu_v128_valid_in <= 1'b1;
+                                    alu_v128_op <= saved_decoded.immediate[8:0];
+                                    alu_v128_a <= operand_a.value;
+                                    state <= STATE_WRITEBACK;
+                                end
+
+                                // Relaxed SIMD - binary operations (swizzle, min, max, q15mulr)
+                                FD_I8X16_RELAXED_SWIZZLE,
+                                FD_F32X4_RELAXED_MIN, FD_F32X4_RELAXED_MAX,
+                                FD_F64X2_RELAXED_MIN, FD_F64X2_RELAXED_MAX,
+                                FD_I16X8_RELAXED_Q15MULR_S,
+                                FD_I16X8_RELAXED_DOT_I8X16_I7X16_S: begin
+                                    stack_multi_pop_en <= 1'b1;
+                                    stack_multi_pop_count <= 8'd2;
+                                    alu_v128_valid_in <= 1'b1;
+                                    alu_v128_op <= saved_decoded.immediate[8:0];
+                                    alu_v128_a <= operand_b.value;
+                                    alu_v128_b <= operand_a.value;
+                                    state <= STATE_WRITEBACK;
+                                end
+
+                                // Relaxed SIMD - ternary operations (madd, nmadd, laneselect, dot_add)
+                                // Stack: [c, b, a] with a on TOS -> result = a*b+c (madd) or bitselect
+                                FD_F32X4_RELAXED_MADD, FD_F32X4_RELAXED_NMADD,
+                                FD_F64X2_RELAXED_MADD, FD_F64X2_RELAXED_NMADD,
+                                FD_I8X16_RELAXED_LANESELECT, FD_I16X8_RELAXED_LANESELECT,
+                                FD_I32X4_RELAXED_LANESELECT, FD_I64X2_RELAXED_LANESELECT,
+                                FD_I32X4_RELAXED_DOT_I8X16_I7X16_ADD_S: begin
+                                    stack_multi_pop_en <= 1'b1;
+                                    stack_multi_pop_count <= 8'd3;
+                                    alu_v128_valid_in <= 1'b1;
+                                    alu_v128_op <= saved_decoded.immediate[8:0];
+                                    alu_v128_a <= operand_c.value;  // First operand (TOS-2)
+                                    alu_v128_b <= operand_b.value;  // Second operand (TOS-1)
+                                    alu_v128_c <= operand_a.value;  // Third operand (TOS)
+                                    state <= STATE_WRITEBACK;
+                                end
+
+                                // Load lane operations - load partial value into lane
+                                FD_V128_LOAD8_LANE, FD_V128_LOAD16_LANE,
+                                FD_V128_LOAD32_LANE, FD_V128_LOAD64_LANE: begin
+                                    logic [31:0] mem_offset;
+                                    // Stack: [addr, v128] with v128 on TOS - pop both, push modified v128
+                                    stack_multi_pop_en <= 1'b1;
+                                    stack_multi_pop_count <= 8'd2;
+                                    // Save the v128 and lane index for later
+                                    exec_result <= operand_a.value;  // v128 value
+                                    exec_result_type <= TYPE_V128;
+                                    // Decoder puts lane in bits 15:8, offset in bits 31:16 and 7:0
+                                    alu_v128_lane_idx <= saved_decoded.immediate2[15:8];  // lane index
+                                    mem_offset = {saved_decoded.immediate2[31:16], saved_decoded.immediate2[7:0]};
+                                    effective_addr_full = {1'b0, operand_b.value[31:0]} + {1'b0, mem_offset};
+                                    effective_addr_overflow = effective_addr_full[32];
+                                    effective_addr = effective_addr_full[31:0];
+                                    if (effective_addr_overflow) begin
+                                        trap_code <= TRAP_OUT_OF_BOUNDS;
+                                        state <= STATE_TRAP;
+                                    end else begin
+                                        mem_rd_en <= 1'b1;
+                                        mem_rd_addr <= effective_addr;
+                                        case (saved_decoded.immediate[8:0])
+                                            FD_V128_LOAD8_LANE:  mem_rd_op <= MEM_LOAD_I8_U;
+                                            FD_V128_LOAD16_LANE: mem_rd_op <= MEM_LOAD_I16_U;
+                                            FD_V128_LOAD32_LANE: mem_rd_op <= MEM_LOAD_I32;
+                                            FD_V128_LOAD64_LANE: mem_rd_op <= MEM_LOAD_I64;
+                                            default: mem_rd_op <= MEM_LOAD_I32;
+                                        endcase
+                                        state <= STATE_MEMORY;
+                                    end
+                                end
+
+                                // Store lane operations - store lane value to memory
+                                FD_V128_STORE8_LANE, FD_V128_STORE16_LANE,
+                                FD_V128_STORE32_LANE, FD_V128_STORE64_LANE: begin
+                                    logic [127:0] v128_val;
+                                    logic [7:0] lane;
+                                    logic [127:0] lane_val;
+                                    logic [31:0] mem_offset;
+
+                                    v128_val = operand_a.value;  // v128 on TOS
+                                    // Decoder puts lane in bits 15:8, offset in bits 31:16 and 7:0
+                                    lane = saved_decoded.immediate2[15:8];
+                                    mem_offset = {saved_decoded.immediate2[31:16], saved_decoded.immediate2[7:0]};
+
+                                    effective_addr_full = {1'b0, operand_b.value[31:0]} + {1'b0, mem_offset};
+                                    effective_addr_overflow = effective_addr_full[32];
+                                    effective_addr = effective_addr_full[31:0];
+
+                                    // Extract the appropriate lane value
+                                    case (saved_decoded.immediate[8:0])
+                                        FD_V128_STORE8_LANE: begin
+                                            lane_val = {120'b0, v128_val[lane*8 +: 8]};
+                                        end
+                                        FD_V128_STORE16_LANE: begin
+                                            lane_val = {112'b0, v128_val[lane*16 +: 16]};
+                                        end
+                                        FD_V128_STORE32_LANE: begin
+                                            lane_val = {96'b0, v128_val[lane*32 +: 32]};
+                                        end
+                                        FD_V128_STORE64_LANE: begin
+                                            lane_val = {64'b0, v128_val[lane*64 +: 64]};
+                                        end
+                                        default: begin
+                                            lane_val = 128'b0;
+                                        end
+                                    endcase
+
+                                    stack_multi_pop_en <= 1'b1;
+                                    stack_multi_pop_count <= 8'd2;
+                                    if (effective_addr_overflow) begin
+                                        trap_code <= TRAP_OUT_OF_BOUNDS;
+                                        state <= STATE_TRAP;
+                                    end else begin
+                                        mem_wr_en <= 1'b1;
+                                        mem_wr_addr <= effective_addr;
+                                        mem_wr_data <= lane_val;
+                                        case (saved_decoded.immediate[8:0])
+                                            FD_V128_STORE8_LANE:  mem_wr_op <= MEM_STORE_I8;
+                                            FD_V128_STORE16_LANE: mem_wr_op <= MEM_STORE_I16;
+                                            FD_V128_STORE32_LANE: mem_wr_op <= MEM_STORE_I32;
+                                            FD_V128_STORE64_LANE: mem_wr_op <= MEM_STORE_I64;
+                                            default: mem_wr_op <= MEM_STORE_I32;
+                                        endcase
+                                        state <= STATE_MEMORY;
+                                    end
+                                end
+
+                                default: begin
+                                    // Unknown FD opcode - skip
+                                    pc <= saved_next_pc;
+                                    state <= STATE_FETCH;
+                                end
+                            endcase
+                        end
+
                         default: begin
                             // Unknown opcode - just skip
                             pc <= saved_next_pc;
@@ -2927,21 +3501,76 @@ module wasm_cpu
                             OP_I32_LOAD, OP_I32_LOAD8_S, OP_I32_LOAD8_U,
                             OP_I32_LOAD16_S, OP_I32_LOAD16_U: begin
                                 stack_push_data.vtype <= TYPE_I32;
+                                stack_push_data.value <= mem_rd_data;
                             end
                             OP_I64_LOAD, OP_I64_LOAD8_S, OP_I64_LOAD8_U,
                             OP_I64_LOAD16_S, OP_I64_LOAD16_U,
                             OP_I64_LOAD32_S, OP_I64_LOAD32_U: begin
                                 stack_push_data.vtype <= TYPE_I64;
+                                stack_push_data.value <= mem_rd_data;
                             end
                             OP_F32_LOAD: begin
                                 stack_push_data.vtype <= TYPE_F32;
+                                stack_push_data.value <= mem_rd_data;
                             end
                             OP_F64_LOAD: begin
                                 stack_push_data.vtype <= TYPE_F64;
+                                stack_push_data.value <= mem_rd_data;
                             end
-                            default: stack_push_data.vtype <= TYPE_I32;
+                            OP_PREFIX_FD: begin
+                                // SIMD memory operations
+                                case (saved_decoded.immediate[8:0])
+                                    // Full v128 loads
+                                    FD_V128_LOAD,
+                                    FD_V128_LOAD8X8_S, FD_V128_LOAD8X8_U,
+                                    FD_V128_LOAD16X4_S, FD_V128_LOAD16X4_U,
+                                    FD_V128_LOAD32X2_S, FD_V128_LOAD32X2_U,
+                                    FD_V128_LOAD8_SPLAT, FD_V128_LOAD16_SPLAT,
+                                    FD_V128_LOAD32_SPLAT, FD_V128_LOAD64_SPLAT,
+                                    FD_V128_LOAD32_ZERO, FD_V128_LOAD64_ZERO: begin
+                                        stack_push_data.vtype <= TYPE_V128;
+                                        stack_push_data.value <= mem_rd_data;
+                                    end
+                                    // Load lane operations - combine loaded value with saved v128
+                                    FD_V128_LOAD8_LANE: begin
+                                        logic [127:0] v128_result;
+                                        v128_result = exec_result;  // Saved v128
+                                        v128_result[alu_v128_lane_idx*8 +: 8] = mem_rd_data[7:0];
+                                        stack_push_data.vtype <= TYPE_V128;
+                                        stack_push_data.value <= v128_result;
+                                    end
+                                    FD_V128_LOAD16_LANE: begin
+                                        logic [127:0] v128_result;
+                                        v128_result = exec_result;
+                                        v128_result[alu_v128_lane_idx*16 +: 16] = mem_rd_data[15:0];
+                                        stack_push_data.vtype <= TYPE_V128;
+                                        stack_push_data.value <= v128_result;
+                                    end
+                                    FD_V128_LOAD32_LANE: begin
+                                        logic [127:0] v128_result;
+                                        v128_result = exec_result;
+                                        v128_result[alu_v128_lane_idx*32 +: 32] = mem_rd_data[31:0];
+                                        stack_push_data.vtype <= TYPE_V128;
+                                        stack_push_data.value <= v128_result;
+                                    end
+                                    FD_V128_LOAD64_LANE: begin
+                                        logic [127:0] v128_result;
+                                        v128_result = exec_result;
+                                        v128_result[alu_v128_lane_idx*64 +: 64] = mem_rd_data[63:0];
+                                        stack_push_data.vtype <= TYPE_V128;
+                                        stack_push_data.value <= v128_result;
+                                    end
+                                    default: begin
+                                        stack_push_data.vtype <= TYPE_V128;
+                                        stack_push_data.value <= mem_rd_data;
+                                    end
+                                endcase
+                            end
+                            default: begin
+                                stack_push_data.vtype <= TYPE_I32;
+                                stack_push_data.value <= mem_rd_data;
+                            end
                         endcase
-                        stack_push_data.value <= mem_rd_data;
                         pc <= saved_next_pc;
                         state <= STATE_FETCH;
                     end
@@ -3077,6 +3706,46 @@ module wasm_cpu
                             state <= STATE_FETCH;
                         end
                     end
+                    else if (alu_v128_valid_out) begin
+                        // SIMD ALU operations
+                        if (alu_v128_trap != TRAP_NONE) begin
+                            trapped <= 1'b1;
+                            trap_code <= alu_v128_trap;
+                            state <= STATE_TRAP;
+                        end else if (alu_v128_is_scalar) begin
+                            // Scalar result (extract lane, all_true, any_true, bitmask)
+                            case (saved_decoded.immediate[8:0])
+                                // i64 extract returns i64
+                                FD_I64X2_EXTRACT_LANE: begin
+                                    stack_push_data.vtype <= TYPE_I64;
+                                    stack_push_data.value <= {64'b0, alu_v128_scalar_result};
+                                end
+                                // f32 extract returns f32
+                                FD_F32X4_EXTRACT_LANE: begin
+                                    stack_push_data.vtype <= TYPE_F32;
+                                    stack_push_data.value <= {96'b0, alu_v128_scalar_result[31:0]};
+                                end
+                                // f64 extract returns f64
+                                FD_F64X2_EXTRACT_LANE: begin
+                                    stack_push_data.vtype <= TYPE_F64;
+                                    stack_push_data.value <= {64'b0, alu_v128_scalar_result};
+                                end
+                                // All other scalar results are i32 (extract_lane_s/u, all_true, any_true, bitmask)
+                                default: begin
+                                    stack_push_data.vtype <= TYPE_I32;
+                                    stack_push_data.value <= {96'b0, alu_v128_scalar_result[31:0]};
+                                end
+                            endcase
+                            pc <= saved_next_pc;
+                            state <= STATE_FETCH;
+                        end else begin
+                            // Vector result
+                            stack_push_data.vtype <= TYPE_V128;
+                            stack_push_data.value <= alu_v128_result;
+                            pc <= saved_next_pc;
+                            state <= STATE_FETCH;
+                        end
+                    end
                     else if (saved_decoded.opcode == OP_SELECT || saved_decoded.opcode == OP_SELECT_T) begin
                         // Select instruction - push the pre-computed result
                         stack_push_data.vtype <= exec_result_type;
@@ -3175,7 +3844,7 @@ module wasm_cpu
                                 // Determine block arity from block type (same logic as OP_IF)
                                 if (saved_decoded.immediate == 64'hFFFFFFFF)
                                     label_push_data.arity <= 8'h0;
-                                else if (saved_decoded.immediate >= 64'h7C && saved_decoded.immediate <= 64'h7F)
+                                else if (saved_decoded.immediate >= 64'h7B && saved_decoded.immediate <= 64'h7F)
                                     label_push_data.arity <= 8'h1;
                                 else
                                     label_push_data.arity <= type_table[saved_decoded.immediate[7:0]].result_count;
@@ -3224,6 +3893,8 @@ module wasm_cpu
                         8'hD6: skip_len = {28'b0, 4'd1 + leb128_len(pc + 1)};  // br_on_non_null (labelidx LEB128)
                         // Extended opcodes (0xFC prefix) - handled by decoder
                         8'hFC: skip_len = {28'b0, decoded.instr_length};  // Use decoded length for FC prefix
+                        // SIMD opcodes (0xFD prefix) - handled by decoder
+                        8'hFD: skip_len = {28'b0, decoded.instr_length};  // Use decoded length for FD prefix
                         default: skip_len = 1;  // Simple opcodes
                     endcase
 
@@ -3290,6 +3961,8 @@ module wasm_cpu
                         8'hD6: skip_len = {28'b0, 4'd1 + leb128_len(pc + 1)};  // br_on_non_null (labelidx LEB128)
                         // Extended opcodes (0xFC prefix) - handled by decoder
                         8'hFC: skip_len = {28'b0, decoded.instr_length};  // Use decoded length for FC prefix
+                        // SIMD opcodes (0xFD prefix) - handled by decoder
+                        8'hFD: skip_len = {28'b0, decoded.instr_length};  // Use decoded length for FD prefix
                         default: skip_len = 1;
                     endcase
 

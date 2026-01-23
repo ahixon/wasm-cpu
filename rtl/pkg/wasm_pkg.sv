@@ -286,6 +286,336 @@ package wasm_pkg;
     } fc_opcode_t;
 
     // =========================================================================
+    // SIMD Opcodes (0xFD prefix) - WebAssembly SIMD v128 operations
+    // =========================================================================
+    // These are sub-opcodes following the 0xFD prefix byte (LEB128 encoded)
+    typedef enum logic [8:0] {
+        // Memory operations (0x00-0x0B)
+        FD_V128_LOAD              = 9'h000,  // v128.load memarg
+        FD_V128_LOAD8X8_S         = 9'h001,  // v128.load8x8_s memarg
+        FD_V128_LOAD8X8_U         = 9'h002,  // v128.load8x8_u memarg
+        FD_V128_LOAD16X4_S        = 9'h003,  // v128.load16x4_s memarg
+        FD_V128_LOAD16X4_U        = 9'h004,  // v128.load16x4_u memarg
+        FD_V128_LOAD32X2_S        = 9'h005,  // v128.load32x2_s memarg
+        FD_V128_LOAD32X2_U        = 9'h006,  // v128.load32x2_u memarg
+        FD_V128_LOAD8_SPLAT       = 9'h007,  // v128.load8_splat memarg
+        FD_V128_LOAD16_SPLAT      = 9'h008,  // v128.load16_splat memarg
+        FD_V128_LOAD32_SPLAT      = 9'h009,  // v128.load32_splat memarg
+        FD_V128_LOAD64_SPLAT      = 9'h00A,  // v128.load64_splat memarg
+        FD_V128_STORE             = 9'h00B,  // v128.store memarg
+
+        // Constant (0x0C)
+        FD_V128_CONST             = 9'h00C,  // v128.const bytes[16]
+
+        // Shuffle/swizzle (0x0D-0x0E)
+        FD_I8X16_SHUFFLE          = 9'h00D,  // i8x16.shuffle lane[16]
+        FD_I8X16_SWIZZLE          = 9'h00E,  // i8x16.swizzle
+
+        // Splat operations (0x0F-0x14)
+        FD_I8X16_SPLAT            = 9'h00F,  // i8x16.splat
+        FD_I16X8_SPLAT            = 9'h010,  // i16x8.splat
+        FD_I32X4_SPLAT            = 9'h011,  // i32x4.splat
+        FD_I64X2_SPLAT            = 9'h012,  // i64x2.splat
+        FD_F32X4_SPLAT            = 9'h013,  // f32x4.splat
+        FD_F64X2_SPLAT            = 9'h014,  // f64x2.splat
+
+        // Lane extract/replace - i8x16 (0x15-0x18)
+        FD_I8X16_EXTRACT_LANE_S   = 9'h015,  // i8x16.extract_lane_s laneidx
+        FD_I8X16_EXTRACT_LANE_U   = 9'h016,  // i8x16.extract_lane_u laneidx
+        FD_I8X16_REPLACE_LANE     = 9'h017,  // i8x16.replace_lane laneidx
+
+        // Lane extract/replace - i16x8 (0x18-0x1B)
+        FD_I16X8_EXTRACT_LANE_S   = 9'h018,  // i16x8.extract_lane_s laneidx
+        FD_I16X8_EXTRACT_LANE_U   = 9'h019,  // i16x8.extract_lane_u laneidx
+        FD_I16X8_REPLACE_LANE     = 9'h01A,  // i16x8.replace_lane laneidx
+
+        // Lane extract/replace - i32x4 (0x1B-0x1C)
+        FD_I32X4_EXTRACT_LANE     = 9'h01B,  // i32x4.extract_lane laneidx
+        FD_I32X4_REPLACE_LANE     = 9'h01C,  // i32x4.replace_lane laneidx
+
+        // Lane extract/replace - i64x2 (0x1D-0x1E)
+        FD_I64X2_EXTRACT_LANE     = 9'h01D,  // i64x2.extract_lane laneidx
+        FD_I64X2_REPLACE_LANE     = 9'h01E,  // i64x2.replace_lane laneidx
+
+        // Lane extract/replace - f32x4 (0x1F-0x20)
+        FD_F32X4_EXTRACT_LANE     = 9'h01F,  // f32x4.extract_lane laneidx
+        FD_F32X4_REPLACE_LANE     = 9'h020,  // f32x4.replace_lane laneidx
+
+        // Lane extract/replace - f64x2 (0x21-0x22)
+        FD_F64X2_EXTRACT_LANE     = 9'h021,  // f64x2.extract_lane laneidx
+        FD_F64X2_REPLACE_LANE     = 9'h022,  // f64x2.replace_lane laneidx
+
+        // i8x16 comparisons (0x23-0x2E)
+        FD_I8X16_EQ               = 9'h023,
+        FD_I8X16_NE               = 9'h024,
+        FD_I8X16_LT_S             = 9'h025,
+        FD_I8X16_LT_U             = 9'h026,
+        FD_I8X16_GT_S             = 9'h027,
+        FD_I8X16_GT_U             = 9'h028,
+        FD_I8X16_LE_S             = 9'h029,
+        FD_I8X16_LE_U             = 9'h02A,
+        FD_I8X16_GE_S             = 9'h02B,
+        FD_I8X16_GE_U             = 9'h02C,
+
+        // i16x8 comparisons (0x2D-0x38)
+        FD_I16X8_EQ               = 9'h02D,
+        FD_I16X8_NE               = 9'h02E,
+        FD_I16X8_LT_S             = 9'h02F,
+        FD_I16X8_LT_U             = 9'h030,
+        FD_I16X8_GT_S             = 9'h031,
+        FD_I16X8_GT_U             = 9'h032,
+        FD_I16X8_LE_S             = 9'h033,
+        FD_I16X8_LE_U             = 9'h034,
+        FD_I16X8_GE_S             = 9'h035,
+        FD_I16X8_GE_U             = 9'h036,
+
+        // i32x4 comparisons (0x37-0x42)
+        FD_I32X4_EQ               = 9'h037,
+        FD_I32X4_NE               = 9'h038,
+        FD_I32X4_LT_S             = 9'h039,
+        FD_I32X4_LT_U             = 9'h03A,
+        FD_I32X4_GT_S             = 9'h03B,
+        FD_I32X4_GT_U             = 9'h03C,
+        FD_I32X4_LE_S             = 9'h03D,
+        FD_I32X4_LE_U             = 9'h03E,
+        FD_I32X4_GE_S             = 9'h03F,
+        FD_I32X4_GE_U             = 9'h040,
+
+        // f32x4 comparisons (0x41-0x46)
+        FD_F32X4_EQ               = 9'h041,
+        FD_F32X4_NE               = 9'h042,
+        FD_F32X4_LT               = 9'h043,
+        FD_F32X4_GT               = 9'h044,
+        FD_F32X4_LE               = 9'h045,
+        FD_F32X4_GE               = 9'h046,
+
+        // f64x2 comparisons (0x47-0x4C)
+        FD_F64X2_EQ               = 9'h047,
+        FD_F64X2_NE               = 9'h048,
+        FD_F64X2_LT               = 9'h049,
+        FD_F64X2_GT               = 9'h04A,
+        FD_F64X2_LE               = 9'h04B,
+        FD_F64X2_GE               = 9'h04C,
+
+        // v128 bitwise (0x4D-0x51)
+        FD_V128_NOT               = 9'h04D,
+        FD_V128_AND               = 9'h04E,
+        FD_V128_ANDNOT            = 9'h04F,
+        FD_V128_OR                = 9'h050,
+        FD_V128_XOR               = 9'h051,
+        FD_V128_BITSELECT         = 9'h052,
+        FD_V128_ANY_TRUE          = 9'h053,
+
+        // Load lane operations (0x54-0x5D)
+        FD_V128_LOAD8_LANE        = 9'h054,
+        FD_V128_LOAD16_LANE       = 9'h055,
+        FD_V128_LOAD32_LANE       = 9'h056,
+        FD_V128_LOAD64_LANE       = 9'h057,
+        FD_V128_STORE8_LANE       = 9'h058,
+        FD_V128_STORE16_LANE      = 9'h059,
+        FD_V128_STORE32_LANE      = 9'h05A,
+        FD_V128_STORE64_LANE      = 9'h05B,
+        FD_V128_LOAD32_ZERO       = 9'h05C,
+        FD_V128_LOAD64_ZERO       = 9'h05D,
+
+        // f32x4 arithmetic (0x5E-0x6B)
+        FD_F32X4_DEMOTE_F64X2_ZERO = 9'h05E,
+        FD_F64X2_PROMOTE_LOW_F32X4 = 9'h05F,
+
+        // i8x16 arithmetic (0x60-0x71)
+        FD_I8X16_ABS              = 9'h060,
+        FD_I8X16_NEG              = 9'h061,
+        FD_I8X16_POPCNT           = 9'h062,
+        FD_I8X16_ALL_TRUE         = 9'h063,
+        FD_I8X16_BITMASK          = 9'h064,
+        FD_I8X16_NARROW_I16X8_S   = 9'h065,
+        FD_I8X16_NARROW_I16X8_U   = 9'h066,
+        FD_F32X4_CEIL             = 9'h067,
+        FD_F32X4_FLOOR            = 9'h068,
+        FD_F32X4_TRUNC            = 9'h069,
+        FD_F32X4_NEAREST          = 9'h06A,
+        FD_I8X16_SHL              = 9'h06B,
+        FD_I8X16_SHR_S            = 9'h06C,
+        FD_I8X16_SHR_U            = 9'h06D,
+        FD_I8X16_ADD              = 9'h06E,
+        FD_I8X16_ADD_SAT_S        = 9'h06F,
+        FD_I8X16_ADD_SAT_U        = 9'h070,
+        FD_I8X16_SUB              = 9'h071,
+        FD_I8X16_SUB_SAT_S        = 9'h072,
+        FD_I8X16_SUB_SAT_U        = 9'h073,
+        FD_F64X2_CEIL             = 9'h074,
+        FD_F64X2_FLOOR            = 9'h075,
+        FD_I8X16_MIN_S            = 9'h076,
+        FD_I8X16_MIN_U            = 9'h077,
+        FD_I8X16_MAX_S            = 9'h078,
+        FD_I8X16_MAX_U            = 9'h079,
+        FD_F64X2_TRUNC            = 9'h07A,
+        FD_I8X16_AVGR_U           = 9'h07B,
+
+        // Extended pairwise addition (0x7C-0x7F)
+        FD_I16X8_EXTADD_PAIRWISE_I8X16_S = 9'h07C,
+        FD_I16X8_EXTADD_PAIRWISE_I8X16_U = 9'h07D,
+        FD_I32X4_EXTADD_PAIRWISE_I16X8_S = 9'h07E,
+        FD_I32X4_EXTADD_PAIRWISE_I16X8_U = 9'h07F,
+
+        // i16x8 arithmetic (0x80-0x9B)
+        FD_I16X8_ABS              = 9'h080,
+        FD_I16X8_NEG              = 9'h081,
+        FD_I16X8_Q15MULR_SAT_S    = 9'h082,
+        FD_I16X8_ALL_TRUE         = 9'h083,
+        FD_I16X8_BITMASK          = 9'h084,
+        FD_I16X8_NARROW_I32X4_S   = 9'h085,
+        FD_I16X8_NARROW_I32X4_U   = 9'h086,
+        FD_I16X8_EXTEND_LOW_I8X16_S  = 9'h087,
+        FD_I16X8_EXTEND_HIGH_I8X16_S = 9'h088,
+        FD_I16X8_EXTEND_LOW_I8X16_U  = 9'h089,
+        FD_I16X8_EXTEND_HIGH_I8X16_U = 9'h08A,
+        FD_I16X8_SHL              = 9'h08B,
+        FD_I16X8_SHR_S            = 9'h08C,
+        FD_I16X8_SHR_U            = 9'h08D,
+        FD_I16X8_ADD              = 9'h08E,
+        FD_I16X8_ADD_SAT_S        = 9'h08F,
+        FD_I16X8_ADD_SAT_U        = 9'h090,
+        FD_I16X8_SUB              = 9'h091,
+        FD_I16X8_SUB_SAT_S        = 9'h092,
+        FD_I16X8_SUB_SAT_U        = 9'h093,
+        FD_F64X2_NEAREST          = 9'h094,
+        FD_I16X8_MUL              = 9'h095,
+        FD_I16X8_MIN_S            = 9'h096,
+        FD_I16X8_MIN_U            = 9'h097,
+        FD_I16X8_MAX_S            = 9'h098,
+        FD_I16X8_MAX_U            = 9'h099,
+        // 0x9A unused
+        FD_I16X8_AVGR_U           = 9'h09B,
+
+        // Extended multiply (0x9C-0x9F)
+        FD_I16X8_EXTMUL_LOW_I8X16_S  = 9'h09C,
+        FD_I16X8_EXTMUL_HIGH_I8X16_S = 9'h09D,
+        FD_I16X8_EXTMUL_LOW_I8X16_U  = 9'h09E,
+        FD_I16X8_EXTMUL_HIGH_I8X16_U = 9'h09F,
+
+        // i32x4 arithmetic (0xA0-0xBF)
+        FD_I32X4_ABS              = 9'h0A0,
+        FD_I32X4_NEG              = 9'h0A1,
+        // 0xA2 unused
+        FD_I32X4_ALL_TRUE         = 9'h0A3,
+        FD_I32X4_BITMASK          = 9'h0A4,
+        // 0xA5-0xA6 unused
+        FD_I32X4_EXTEND_LOW_I16X8_S  = 9'h0A7,
+        FD_I32X4_EXTEND_HIGH_I16X8_S = 9'h0A8,
+        FD_I32X4_EXTEND_LOW_I16X8_U  = 9'h0A9,
+        FD_I32X4_EXTEND_HIGH_I16X8_U = 9'h0AA,
+        FD_I32X4_SHL              = 9'h0AB,
+        FD_I32X4_SHR_S            = 9'h0AC,
+        FD_I32X4_SHR_U            = 9'h0AD,
+        FD_I32X4_ADD              = 9'h0AE,
+        // 0xAF-0xB0 unused
+        FD_I32X4_SUB              = 9'h0B1,
+        // 0xB2-0xB4 unused
+        FD_I32X4_MUL              = 9'h0B5,
+        FD_I32X4_MIN_S            = 9'h0B6,
+        FD_I32X4_MIN_U            = 9'h0B7,
+        FD_I32X4_MAX_S            = 9'h0B8,
+        FD_I32X4_MAX_U            = 9'h0B9,
+        FD_I32X4_DOT_I16X8_S      = 9'h0BA,
+        // 0xBB unused
+        FD_I32X4_EXTMUL_LOW_I16X8_S  = 9'h0BC,
+        FD_I32X4_EXTMUL_HIGH_I16X8_S = 9'h0BD,
+        FD_I32X4_EXTMUL_LOW_I16X8_U  = 9'h0BE,
+        FD_I32X4_EXTMUL_HIGH_I16X8_U = 9'h0BF,
+
+        // i64x2 arithmetic (0xC0-0xDF)
+        FD_I64X2_ABS              = 9'h0C0,
+        FD_I64X2_NEG              = 9'h0C1,
+        // 0xC2 unused
+        FD_I64X2_ALL_TRUE         = 9'h0C3,
+        FD_I64X2_BITMASK          = 9'h0C4,
+        // 0xC5-0xC6 unused
+        FD_I64X2_EXTEND_LOW_I32X4_S  = 9'h0C7,
+        FD_I64X2_EXTEND_HIGH_I32X4_S = 9'h0C8,
+        FD_I64X2_EXTEND_LOW_I32X4_U  = 9'h0C9,
+        FD_I64X2_EXTEND_HIGH_I32X4_U = 9'h0CA,
+        FD_I64X2_SHL              = 9'h0CB,
+        FD_I64X2_SHR_S            = 9'h0CC,
+        FD_I64X2_SHR_U            = 9'h0CD,
+        FD_I64X2_ADD              = 9'h0CE,
+        // 0xCF-0xD0 unused
+        FD_I64X2_SUB              = 9'h0D1,
+        // 0xD2-0xD4 unused
+        FD_I64X2_MUL              = 9'h0D5,
+        FD_I64X2_EQ               = 9'h0D6,
+        FD_I64X2_NE               = 9'h0D7,
+        FD_I64X2_LT_S             = 9'h0D8,
+        FD_I64X2_GT_S             = 9'h0D9,
+        FD_I64X2_LE_S             = 9'h0DA,
+        FD_I64X2_GE_S             = 9'h0DB,
+        FD_I64X2_EXTMUL_LOW_I32X4_S  = 9'h0DC,
+        FD_I64X2_EXTMUL_HIGH_I32X4_S = 9'h0DD,
+        FD_I64X2_EXTMUL_LOW_I32X4_U  = 9'h0DE,
+        FD_I64X2_EXTMUL_HIGH_I32X4_U = 9'h0DF,
+
+        // f32x4 arithmetic (0xE0-0xF3)
+        FD_F32X4_ABS              = 9'h0E0,
+        FD_F32X4_NEG              = 9'h0E1,
+        // 0xE2 unused
+        FD_F32X4_SQRT             = 9'h0E3,
+        FD_F32X4_ADD              = 9'h0E4,
+        FD_F32X4_SUB              = 9'h0E5,
+        FD_F32X4_MUL              = 9'h0E6,
+        FD_F32X4_DIV              = 9'h0E7,
+        FD_F32X4_MIN              = 9'h0E8,
+        FD_F32X4_MAX              = 9'h0E9,
+        FD_F32X4_PMIN             = 9'h0EA,
+        FD_F32X4_PMAX             = 9'h0EB,
+
+        // f64x2 arithmetic (0xEC-0xFF)
+        FD_F64X2_ABS              = 9'h0EC,
+        FD_F64X2_NEG              = 9'h0ED,
+        // 0xEE unused
+        FD_F64X2_SQRT             = 9'h0EF,
+        FD_F64X2_ADD              = 9'h0F0,
+        FD_F64X2_SUB              = 9'h0F1,
+        FD_F64X2_MUL              = 9'h0F2,
+        FD_F64X2_DIV              = 9'h0F3,
+        FD_F64X2_MIN              = 9'h0F4,
+        FD_F64X2_MAX              = 9'h0F5,
+        FD_F64X2_PMIN             = 9'h0F6,
+        FD_F64X2_PMAX             = 9'h0F7,
+
+        // Conversions (0xF8-0xFF and 0x100+)
+        FD_I32X4_TRUNC_SAT_F32X4_S = 9'h0F8,
+        FD_I32X4_TRUNC_SAT_F32X4_U = 9'h0F9,
+        FD_F32X4_CONVERT_I32X4_S   = 9'h0FA,
+        FD_F32X4_CONVERT_I32X4_U   = 9'h0FB,
+        FD_I32X4_TRUNC_SAT_F64X2_S_ZERO = 9'h0FC,
+        FD_I32X4_TRUNC_SAT_F64X2_U_ZERO = 9'h0FD,
+        FD_F64X2_CONVERT_LOW_I32X4_S = 9'h0FE,
+        FD_F64X2_CONVERT_LOW_I32X4_U = 9'h0FF,
+
+        // Relaxed SIMD (0x100+)
+        FD_I8X16_RELAXED_SWIZZLE  = 9'h100,
+        FD_I32X4_RELAXED_TRUNC_F32X4_S = 9'h101,
+        FD_I32X4_RELAXED_TRUNC_F32X4_U = 9'h102,
+        FD_I32X4_RELAXED_TRUNC_F64X2_S_ZERO = 9'h103,
+        FD_I32X4_RELAXED_TRUNC_F64X2_U_ZERO = 9'h104,
+        FD_F32X4_RELAXED_MADD = 9'h105,
+        FD_F32X4_RELAXED_NMADD = 9'h106,
+        FD_F64X2_RELAXED_MADD = 9'h107,
+        FD_F64X2_RELAXED_NMADD = 9'h108,
+        FD_I8X16_RELAXED_LANESELECT = 9'h109,
+        FD_I16X8_RELAXED_LANESELECT = 9'h10A,
+        FD_I32X4_RELAXED_LANESELECT = 9'h10B,
+        FD_I64X2_RELAXED_LANESELECT = 9'h10C,
+        FD_F32X4_RELAXED_MIN = 9'h10D,
+        FD_F32X4_RELAXED_MAX = 9'h10E,
+        FD_F64X2_RELAXED_MIN = 9'h10F,
+        FD_F64X2_RELAXED_MAX = 9'h110,
+        FD_I16X8_RELAXED_Q15MULR_S = 9'h111,
+        FD_I16X8_RELAXED_DOT_I8X16_I7X16_S = 9'h112,
+        FD_I32X4_RELAXED_DOT_I8X16_I7X16_ADD_S = 9'h113
+    } fd_opcode_t;
+
+    // =========================================================================
     // ALU Operation Types
     // =========================================================================
     typedef enum logic [4:0] {
@@ -349,7 +679,7 @@ package wasm_pkg;
     // =========================================================================
     // Memory Operation Types (WASM-specific, includes sign extension info)
     // =========================================================================
-    typedef enum logic [3:0] {
+    typedef enum logic [4:0] {
         MEM_LOAD_I32,
         MEM_LOAD_I64,
         MEM_LOAD_F32,
@@ -364,7 +694,23 @@ package wasm_pkg;
         MEM_STORE_I64,
         MEM_STORE_I8,
         MEM_STORE_I16,
-        MEM_STORE_I32_FROM_I64
+        MEM_STORE_I32_FROM_I64,
+        // SIMD memory operations (v128 = 16 bytes)
+        MEM_LOAD_V128,
+        MEM_STORE_V128,
+        // SIMD lane load/store operations
+        MEM_LOAD_V128_8_SPLAT,
+        MEM_LOAD_V128_16_SPLAT,
+        MEM_LOAD_V128_32_SPLAT,
+        MEM_LOAD_V128_64_SPLAT,
+        MEM_LOAD_V128_8X8_S,
+        MEM_LOAD_V128_8X8_U,
+        MEM_LOAD_V128_16X4_S,
+        MEM_LOAD_V128_16X4_U,
+        MEM_LOAD_V128_32X2_S,
+        MEM_LOAD_V128_32X2_U,
+        MEM_LOAD_V128_32_ZERO,
+        MEM_LOAD_V128_64_ZERO
     } mem_op_t;
 
     // =========================================================================
@@ -372,29 +718,30 @@ package wasm_pkg;
     // =========================================================================
 
     // Memory access size (power of 2 bytes)
-    typedef enum logic [1:0] {
-        MEM_SIZE_1 = 2'b00,  // 1 byte
-        MEM_SIZE_2 = 2'b01,  // 2 bytes
-        MEM_SIZE_4 = 2'b10,  // 4 bytes
-        MEM_SIZE_8 = 2'b11   // 8 bytes
+    typedef enum logic [2:0] {
+        MEM_SIZE_1  = 3'b000,  // 1 byte
+        MEM_SIZE_2  = 3'b001,  // 2 bytes
+        MEM_SIZE_4  = 3'b010,  // 4 bytes
+        MEM_SIZE_8  = 3'b011,  // 8 bytes
+        MEM_SIZE_16 = 3'b100   // 16 bytes (v128)
     } mem_size_t;
 
     // Memory bus request (master -> slave)
     // Simple valid/ready handshake, compatible with AXI-lite conversion
     typedef struct packed {
-        logic        valid;      // Request valid
-        logic        write;      // 0 = read, 1 = write
-        logic [31:0] addr;       // Byte address
-        mem_size_t   size;       // Access size (1/2/4/8 bytes)
-        logic [63:0] wdata;      // Write data (little-endian, right-aligned)
+        logic         valid;      // Request valid
+        logic         write;      // 0 = read, 1 = write
+        logic [31:0]  addr;       // Byte address
+        mem_size_t    size;       // Access size (1/2/4/8/16 bytes)
+        logic [127:0] wdata;      // Write data (little-endian, right-aligned)
     } mem_bus_req_t;
 
     // Memory bus response (slave -> master)
     typedef struct packed {
-        logic        ready;      // Can accept request this cycle
-        logic        rvalid;     // Read response valid
-        logic [63:0] rdata;      // Read data (little-endian, zero-extended)
-        logic        error;      // Access error (out of bounds, etc.)
+        logic         ready;      // Can accept request this cycle
+        logic         rvalid;     // Read response valid
+        logic [127:0] rdata;      // Read data (little-endian, zero-extended)
+        logic         error;      // Access error (out of bounds, etc.)
     } mem_bus_resp_t;
 
     // Memory management request (WASM-specific, separate from data path)
@@ -474,15 +821,24 @@ package wasm_pkg;
     // Helper function: Convert mem_op_t to mem_size_t
     function automatic mem_size_t mem_op_to_size(mem_op_t op);
         case (op)
-            MEM_LOAD_I8_S, MEM_LOAD_I8_U, MEM_STORE_I8:
+            MEM_LOAD_I8_S, MEM_LOAD_I8_U, MEM_STORE_I8,
+            MEM_LOAD_V128_8_SPLAT:
                 return MEM_SIZE_1;
-            MEM_LOAD_I16_S, MEM_LOAD_I16_U, MEM_STORE_I16:
+            MEM_LOAD_I16_S, MEM_LOAD_I16_U, MEM_STORE_I16,
+            MEM_LOAD_V128_16_SPLAT:
                 return MEM_SIZE_2;
             MEM_LOAD_I32, MEM_LOAD_F32, MEM_LOAD_I32_S, MEM_LOAD_I32_U,
-            MEM_STORE_I32, MEM_STORE_I32_FROM_I64:
+            MEM_STORE_I32, MEM_STORE_I32_FROM_I64,
+            MEM_LOAD_V128_32_SPLAT, MEM_LOAD_V128_32_ZERO:
                 return MEM_SIZE_4;
-            MEM_LOAD_I64, MEM_LOAD_F64, MEM_STORE_I64:
+            MEM_LOAD_I64, MEM_LOAD_F64, MEM_STORE_I64,
+            MEM_LOAD_V128_64_SPLAT, MEM_LOAD_V128_64_ZERO,
+            MEM_LOAD_V128_8X8_S, MEM_LOAD_V128_8X8_U,
+            MEM_LOAD_V128_16X4_S, MEM_LOAD_V128_16X4_U,
+            MEM_LOAD_V128_32X2_S, MEM_LOAD_V128_32X2_U:
                 return MEM_SIZE_8;
+            MEM_LOAD_V128, MEM_STORE_V128:
+                return MEM_SIZE_16;
             default:
                 return MEM_SIZE_4;
         endcase
@@ -492,7 +848,8 @@ package wasm_pkg;
     function automatic logic mem_op_is_write(mem_op_t op);
         case (op)
             MEM_STORE_I32, MEM_STORE_I64, MEM_STORE_I8,
-            MEM_STORE_I16, MEM_STORE_I32_FROM_I64:
+            MEM_STORE_I16, MEM_STORE_I32_FROM_I64,
+            MEM_STORE_V128:
                 return 1'b1;
             default:
                 return 1'b0;
@@ -588,12 +945,12 @@ package wasm_pkg;
     } table_cache_entry_t;
 
     // =========================================================================
-    // Stack Entry (64-bit value with type tag)
+    // Stack Entry (128-bit value with type tag for SIMD support)
     // =========================================================================
     typedef struct packed {
-        valtype_t  vtype;    // 4 bits
-        logic [63:0] value;  // 64 bits
-    } stack_entry_t;         // Total: 68 bits
+        valtype_t    vtype;  // 4 bits
+        logic [127:0] value; // 128 bits (upper 64 bits unused for non-SIMD types)
+    } stack_entry_t;         // Total: 132 bits
 
     // =========================================================================
     // Label Entry (for block/loop/if control flow)
@@ -630,24 +987,24 @@ package wasm_pkg;
     } func_entry_t;
 
     // =========================================================================
-    // Global Entry
+    // Global Entry (128-bit value for SIMD support)
     // =========================================================================
     typedef struct packed {
-        valtype_t    vtype;
-        logic        mutable_flag;
-        logic [63:0] value;
+        valtype_t     vtype;
+        logic         mutable_flag;
+        logic [127:0] value;        // 128 bits (upper 64 bits unused for non-SIMD types)
     } global_entry_t;
 
     // =========================================================================
-    // Decoded Instruction
+    // Decoded Instruction (128-bit immediate for SIMD v128.const)
     // =========================================================================
     typedef struct packed {
-        opcode_t     opcode;
-        logic [63:0] immediate;      // Immediate value (const, index, etc.)
-        logic [31:0] immediate2;     // Second immediate (for memory ops: offset)
-        logic [7:0]  instr_length;   // Length of instruction in bytes
-        logic        has_immediate;
-        logic        has_immediate2;
+        opcode_t      opcode;
+        logic [127:0] immediate;     // Immediate value (const, index, sub-opcode for SIMD)
+        logic [127:0] immediate2;    // Second immediate (for memory ops: offset, v128.const: value)
+        logic [7:0]   instr_length;  // Length of instruction in bytes
+        logic         has_immediate;
+        logic         has_immediate2;
     } decoded_instr_t;
 
     // =========================================================================

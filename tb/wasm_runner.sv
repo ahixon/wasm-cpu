@@ -4,8 +4,8 @@
 //    or: ./Vwasm_runner +wasm=test.wasm +expected=42 +func=0 [+trap] [+i64]
 // Test list format (one per line):
 //   <func_idx> <test_mode> <num_args> [<arg_type> <arg_hex>]... <num_results> [<result_type> <result_hex>]...
-// test_mode: 0=verify result, 1=expect trap, 2=run only (void function)
-// arg_type/result_type: 0=i32, 1=i64, 2=f32, 3=f64
+// test_mode: 0=verify result, 1=expect trap, 2=run only (void function), 3=verify with alternatives
+// arg_type/result_type: 0=i32, 1=i64, 2=f32, 3=f64, 4=v128
 
 `timescale 1ns/1ps
 
@@ -202,14 +202,24 @@ module wasm_runner;
     // Result storage for tests (supports multi-value returns)
     // Max 16 results per test, 1024 tests
     int test_num_results [0:1023];
-    int test_result_types [0:1023][0:15];     // 0=i32, 1=i64, 2=f32, 3=f64
+    int test_result_types [0:1023][0:15];     // 0=i32, 1=i64, 2=f32, 3=f64, 4=v128
     longint test_result_values [0:1023][0:15];
+    longint test_result_values_hi [0:1023][0:15];  // High 64 bits for v128
+
+    // Alternative results for mode 3 (relaxed SIMD either tests)
+    // Max 8 alternatives per test, each with up to 4 results
+    int test_num_alternatives [0:1023];
+    int test_alt_num_results [0:1023][0:7];
+    int test_alt_result_types [0:1023][0:7][0:3];
+    longint test_alt_result_values [0:1023][0:7][0:3];
+    longint test_alt_result_values_hi [0:1023][0:7][0:3];
 
     // Argument storage for tests
     // Max 32 arguments per test, 1024 tests
     int test_num_args [0:1023];
-    int test_arg_types [0:1023][0:31];       // 0=i32, 1=i64, 2=f32, 3=f64
+    int test_arg_types [0:1023][0:31];       // 0=i32, 1=i64, 2=f32, 3=f64, 4=v128
     longint test_arg_values [0:1023][0:31];
+    longint test_arg_values_hi [0:1023][0:31];  // High 64 bits for v128
 
     // Function information extracted from WASM
     typedef struct {
@@ -723,6 +733,7 @@ module wasm_runner;
         int valtype, mutability;
         longint init_val;
         int opcode;
+        logic is_v128;  // Flag to skip init_val assignment for v128
 
         num_globals = 0;
 
@@ -745,6 +756,7 @@ module wasm_runner;
                     // Init expression: opcode + value + end
                     opcode = wasm_data[pos];
                     pos++;
+                    is_v128 = 1'b0;
 
                     case (opcode)
                         8'h41: begin  // i32.const
@@ -780,6 +792,22 @@ module wasm_runner;
                             init_val = read_leb128_u(pos);  // function index
                             global_entries[num_globals].vtype = TYPE_FUNCREF;
                         end
+                        8'hFD: begin  // SIMD prefix (for v128.const)
+                            automatic int sub_opcode;
+                            sub_opcode = read_leb128_u(pos);  // Should be 0x0C for v128.const
+                            if (sub_opcode == 12) begin  // v128.const
+                                // Read 16 bytes little-endian into 128-bit value
+                                for (int i = 0; i < 16; i++) begin
+                                    global_entries[num_globals].value[i*8 +: 8] = wasm_data[pos];
+                                    pos++;
+                                end
+                                global_entries[num_globals].vtype = TYPE_V128;
+                                is_v128 = 1'b1;  // Don't overwrite with init_val
+                            end else begin
+                                init_val = 0;
+                                global_entries[num_globals].vtype = TYPE_I32;
+                            end
+                        end
                         default: begin
                             init_val = 0;
                             global_entries[num_globals].vtype = TYPE_I32;
@@ -788,7 +816,8 @@ module wasm_runner;
 
                     if (wasm_data[pos] == 8'h0B) pos++;  // end
 
-                    global_entries[num_globals].value = init_val;
+                    if (!is_v128)
+                        global_entries[num_globals].value = init_val;
                     global_entries[num_globals].mutable_flag = (mutability == 1);
                     num_globals++;
                 end
@@ -1371,13 +1400,13 @@ module wasm_runner;
     // Parse test list file
     // Format: <func_idx> <test_mode> <num_args> [<arg_type> <arg_hex>]... <num_results> [<result_type> <result_hex>]...
     // test_mode: 0=verify result, 1=expect trap, 2=run only (void function)
-    // arg_type/result_type: 0=i32, 1=i64, 2=f32, 3=f64
+    // arg_type/result_type: 0=i32, 1=i64, 2=f32, 3=f64, 4=v128 (v128 has two hex values: lo hi)
     task automatic parse_testlist(input string filename);
         int fd;
         int func_id;
         int test_mode, nargs, nresults;
         int arg_type, result_type;
-        longint arg_val, result_val;
+        longint arg_val, arg_val_hi, result_val, result_val_hi;
 
         num_tests = 0;
         fd = $fopen(filename, "r");
@@ -1399,21 +1428,78 @@ module wasm_runner;
                     if ($fscanf(fd, " %d %h", arg_type, arg_val) == 2) begin
                         test_arg_types[num_tests][a] = arg_type;
                         test_arg_values[num_tests][a] = arg_val;
+                        // For v128 (type 4), read the high 64 bits as well
+                        if (arg_type == 4) begin
+                            if ($fscanf(fd, " %h", arg_val_hi) == 1) begin
+                                test_arg_values_hi[num_tests][a] = arg_val_hi;
+                            end
+                        end else begin
+                            test_arg_values_hi[num_tests][a] = 0;
+                        end
                     end
                 end
 
-                // Read number of expected results
-                if ($fscanf(fd, " %d", nresults) == 1) begin
-                    test_num_results[num_tests] = nresults;
-                    // Read expected results
-                    for (int r = 0; r < nresults && r < 16; r++) begin
-                        if ($fscanf(fd, " %d %h", result_type, result_val) == 2) begin
-                            test_result_types[num_tests][r] = result_type;
-                            test_result_values[num_tests][r] = result_val;
+                // Handle mode 3 (alternatives) differently
+                if (test_mode == 3) begin
+                    // Read number of alternatives
+                    int nalts;
+                    if ($fscanf(fd, " %d", nalts) == 1) begin
+                        test_num_alternatives[num_tests] = nalts;
+                        // Read each alternative
+                        for (int alt = 0; alt < nalts && alt < 8; alt++) begin
+                            if ($fscanf(fd, " %d", nresults) == 1) begin
+                                test_alt_num_results[num_tests][alt] = nresults;
+                                // Read expected results for this alternative
+                                for (int r = 0; r < nresults && r < 4; r++) begin
+                                    if ($fscanf(fd, " %d %h", result_type, result_val) == 2) begin
+                                        test_alt_result_types[num_tests][alt][r] = result_type;
+                                        test_alt_result_values[num_tests][alt][r] = result_val;
+                                        // For v128 (type 4), read the high 64 bits as well
+                                        if (result_type == 4) begin
+                                            if ($fscanf(fd, " %h", result_val_hi) == 1) begin
+                                                test_alt_result_values_hi[num_tests][alt][r] = result_val_hi;
+                                            end
+                                        end else begin
+                                            test_alt_result_values_hi[num_tests][alt][r] = 0;
+                                        end
+                                    end
+                                end
+                            end
                         end
+                        // Use first alternative as primary result for compatibility
+                        test_num_results[num_tests] = test_alt_num_results[num_tests][0];
+                        for (int r = 0; r < test_alt_num_results[num_tests][0] && r < 16; r++) begin
+                            test_result_types[num_tests][r] = test_alt_result_types[num_tests][0][r];
+                            test_result_values[num_tests][r] = test_alt_result_values[num_tests][0][r];
+                            test_result_values_hi[num_tests][r] = test_alt_result_values_hi[num_tests][0][r];
+                        end
+                    end else begin
+                        test_num_alternatives[num_tests] = 0;
+                        test_num_results[num_tests] = 0;
                     end
                 end else begin
-                    test_num_results[num_tests] = 0;
+                    // Normal modes - read number of expected results
+                    test_num_alternatives[num_tests] = 0;
+                    if ($fscanf(fd, " %d", nresults) == 1) begin
+                        test_num_results[num_tests] = nresults;
+                        // Read expected results
+                        for (int r = 0; r < nresults && r < 16; r++) begin
+                            if ($fscanf(fd, " %d %h", result_type, result_val) == 2) begin
+                                test_result_types[num_tests][r] = result_type;
+                                test_result_values[num_tests][r] = result_val;
+                                // For v128 (type 4), read the high 64 bits as well
+                                if (result_type == 4) begin
+                                    if ($fscanf(fd, " %h", result_val_hi) == 1) begin
+                                        test_result_values_hi[num_tests][r] = result_val_hi;
+                                    end
+                                end else begin
+                                    test_result_values_hi[num_tests][r] = 0;
+                                end
+                            end
+                        end
+                    end else begin
+                        test_num_results[num_tests] = 0;
+                    end
                 end
 
                 num_tests++;
@@ -1430,9 +1516,11 @@ module wasm_runner;
         input int num_args,
         input int arg_types [0:31],
         input longint arg_values [0:31],
+        input longint arg_values_hi [0:31],
         input int num_results,
         input int exp_result_types [0:15],
         input longint exp_result_values [0:15],
+        input longint exp_result_values_hi [0:15],
         output int passed
     );
         int cycles;
@@ -1453,7 +1541,7 @@ module wasm_runner;
             local_init_wr_base = 16'h0;
             local_init_wr_idx = i[7:0];
             local_init_wr_data.vtype = TYPE_I32;
-            local_init_wr_data.value = 64'h0;
+            local_init_wr_data.value = 128'h0;
         end
         @(posedge clk);
         local_init_wr_en = 0;
@@ -1465,18 +1553,25 @@ module wasm_runner;
             local_init_wr_en = 1;
             local_init_wr_base = 16'h0;  // Entry function uses local_base = 0
             local_init_wr_idx = a[7:0];
-            // Map arg type: 0=i32, 1=i64, 2=f32, 3=f64, 5=funcref, 6=externref
+            // Map arg type: 0=i32, 1=i64, 2=f32, 3=f64, 4=v128, 5=funcref, 6=externref
             case (arg_types[a])
                 0: local_init_wr_data.vtype = TYPE_I32;
                 1: local_init_wr_data.vtype = TYPE_I64;
                 2: local_init_wr_data.vtype = TYPE_F32;
                 3: local_init_wr_data.vtype = TYPE_F64;
+                4: local_init_wr_data.vtype = TYPE_V128;
                 5: local_init_wr_data.vtype = TYPE_FUNCREF;
                 6: local_init_wr_data.vtype = TYPE_EXTERNREF;
                 default: local_init_wr_data.vtype = TYPE_I32;
             endcase
-            local_init_wr_data.value = arg_values[a];
-            $display("DEBUG: Writing local[%0d] = 0x%016x, CPU state = %0d", a, arg_values[a], dbg_state);
+            // For v128, combine lo and hi parts; for others, zero-extend
+            if (arg_types[a] == 4) begin
+                local_init_wr_data.value = {arg_values_hi[a], arg_values[a]};
+                $display("DEBUG: Writing local[%0d] = v128 0x%032x, CPU state = %0d", a, {arg_values_hi[a], arg_values[a]}, dbg_state);
+            end else begin
+                local_init_wr_data.value = {64'b0, arg_values[a]};
+                $display("DEBUG: Writing local[%0d] = 0x%016x, CPU state = %0d", a, arg_values[a], dbg_state);
+            end
         end
         @(posedge clk);
         local_init_wr_en = 0;
@@ -1497,10 +1592,10 @@ module wasm_runner;
             @(posedge clk);
             cycles++;
 
-            // Debug: print every 100000 cycles only (to avoid spam)
-            // if (cycles % 100000 == 0)
-            //     $display("DEBUG cycle %0d: halted=%b ext_halted_o=%b trapped=%b trap_code=%0d",
-            //              cycles, halted, ext_halted_o, trapped, trap_code);
+            // Debug: print every 100000 cycles
+            if (cycles % 100000 == 0)
+                $display("DEBUG cycle %0d: state=%0d pc=%h stack_ptr=%0d",
+                         cycles, dbg_state, dut.pc, dut.stack_ptr);
 
             // Handle S-mode traps - testbench acts as supervisor
             if (ext_halted_o) begin
@@ -1603,10 +1698,31 @@ module wasm_runner;
                     // Check all results match
                     all_match = 1;
                     for (int r = 0; r < num_results && r < 16; r++) begin
-                        // Check based on type (32-bit vs 64-bit comparison)
-                        if (exp_result_types[r] == 1 || exp_result_types[r] == 3) begin
+                        // Check based on type (32-bit, 64-bit, or 128-bit comparison)
+                        if (exp_result_types[r] == 4) begin
+                            // v128 - NaN-aware comparison for f64x2/f32x4 lanes
+                            // Treat canonical NaNs as equal regardless of sign
+                            logic [127:0] expected_v128;
+                            logic [63:0] exp_lo, exp_hi, act_lo, act_hi;
+                            logic lo_match, hi_match;
+                            expected_v128 = {exp_result_values_hi[r], exp_result_values[r]};
+                            exp_lo = expected_v128[63:0];
+                            exp_hi = expected_v128[127:64];
+                            act_lo = result_values[r].value[63:0];
+                            act_hi = result_values[r].value[127:64];
+                            // For f64 lanes: canonical NaN is 7ff8000000000000 or fff8000000000000
+                            // (exponent all 1s, mantissa MSB set, other bits clear)
+                            lo_match = (exp_lo == act_lo) ||
+                                       (((exp_lo & 64'h7FFFFFFFFFFFFFFF) == 64'h7FF8000000000000) &&
+                                        ((act_lo & 64'h7FFFFFFFFFFFFFFF) == 64'h7FF8000000000000));
+                            hi_match = (exp_hi == act_hi) ||
+                                       (((exp_hi & 64'h7FFFFFFFFFFFFFFF) == 64'h7FF8000000000000) &&
+                                        ((act_hi & 64'h7FFFFFFFFFFFFFFF) == 64'h7FF8000000000000));
+                            if (!(lo_match && hi_match))
+                                all_match = 0;
+                        end else if (exp_result_types[r] == 1 || exp_result_types[r] == 3) begin
                             // i64 or f64 - full 64-bit comparison
-                            if (result_values[r].value != exp_result_values[r])
+                            if (result_values[r].value[63:0] != exp_result_values[r])
                                 all_match = 0;
                         end else begin
                             // i32 or f32 - 32-bit comparison
@@ -1622,6 +1738,15 @@ module wasm_runner;
             end
             2: begin  // Run only (void function) - always pass if no unexpected trap
                 passed = trapped ? 0 : 1;
+            end
+            3: begin  // Test with alternatives - pass if any alternative matches
+                if (trapped) begin
+                    passed = 0;
+                end else begin
+                    // This mode should not be reached from run_invocation directly
+                    // It's handled specially in the main test loop
+                    passed = 0;
+                end
             end
             default: begin
                 passed = 0;
@@ -1835,28 +1960,88 @@ module wasm_runner;
                 // Copy arguments and expected results for this test into local arrays
                 automatic int local_arg_types [0:31];
                 automatic longint local_arg_values [0:31];
+                automatic longint local_arg_values_hi [0:31];
                 automatic int local_result_types [0:15];
                 automatic longint local_result_values [0:15];
+                automatic longint local_result_values_hi [0:15];
+                // For alternatives checking
+                automatic int effective_mode;
+                automatic int alt_result_types [0:15];
+                automatic longint alt_result_values [0:15];
+                automatic longint alt_result_values_hi [0:15];
+                automatic int all_match;
+
                 for (int a = 0; a < 32; a++) begin
                     local_arg_types[a] = test_arg_types[t][a];
                     local_arg_values[a] = test_arg_values[t][a];
+                    local_arg_values_hi[a] = test_arg_values_hi[t][a];
                 end
                 for (int r = 0; r < 16; r++) begin
                     local_result_types[r] = test_result_types[t][r];
                     local_result_values[r] = test_result_values[t][r];
+                    local_result_values_hi[r] = test_result_values_hi[t][r];
                 end
+
+                // For mode 3, run with mode 0 (verify) but check all alternatives
+                effective_mode = (test_mode_list[t] == 3) ? 0 : test_mode_list[t];
 
                 run_invocation(
                     test_func_list[t],
-                    test_mode_list[t],
+                    effective_mode,
                     test_num_args[t],
                     local_arg_types,
                     local_arg_values,
+                    local_arg_values_hi,
                     test_num_results[t],
                     local_result_types,
                     local_result_values,
+                    local_result_values_hi,
                     test_passed
                 );
+
+                // For mode 3, check other alternatives if first didn't match
+                if (!test_passed && test_mode_list[t] == 3 && !trapped) begin
+                    for (int alt = 1; alt < test_num_alternatives[t] && alt < 8 && !test_passed; alt++) begin
+
+                        // Copy this alternative's expected results
+                        for (int r = 0; r < 4; r++) begin
+                            alt_result_types[r] = test_alt_result_types[t][alt][r];
+                            alt_result_values[r] = test_alt_result_values[t][alt][r];
+                            alt_result_values_hi[r] = test_alt_result_values_hi[t][alt][r];
+                        end
+
+                        // Check if actual results match this alternative
+                        all_match = 1;
+                        for (int r = 0; r < test_alt_num_results[t][alt] && r < 4; r++) begin
+                            if (alt_result_types[r] == 4) begin
+                                // v128 - NaN-aware comparison
+                                logic [63:0] exp_lo, exp_hi, act_lo, act_hi;
+                                logic lo_match, hi_match;
+                                exp_lo = alt_result_values[r];
+                                exp_hi = alt_result_values_hi[r];
+                                act_lo = result_values[r].value[63:0];
+                                act_hi = result_values[r].value[127:64];
+                                lo_match = (exp_lo == act_lo) ||
+                                           (((exp_lo & 64'h7FFFFFFFFFFFFFFF) == 64'h7FF8000000000000) &&
+                                            ((act_lo & 64'h7FFFFFFFFFFFFFFF) == 64'h7FF8000000000000));
+                                hi_match = (exp_hi == act_hi) ||
+                                           (((exp_hi & 64'h7FFFFFFFFFFFFFFF) == 64'h7FF8000000000000) &&
+                                            ((act_hi & 64'h7FFFFFFFFFFFFFFF) == 64'h7FF8000000000000));
+                                if (!(lo_match && hi_match))
+                                    all_match = 0;
+                            end else if (alt_result_types[r] == 1 || alt_result_types[r] == 3) begin
+                                // i64 or f64
+                                if (result_values[r].value[63:0] != alt_result_values[r])
+                                    all_match = 0;
+                            end else begin
+                                // i32 or f32
+                                if (result_values[r].value[31:0] != alt_result_values[r][31:0])
+                                    all_match = 0;
+                            end
+                        end
+                        test_passed = all_match;
+                    end
+                end
 
                 if (test_passed) begin
                     total_passed++;
@@ -1872,10 +2057,16 @@ module wasm_runner;
                         $display("FAIL: test %0d func %0d (unexpected trap, code=%0d)",
                             t, test_func_list[t], trap_code);
                     end else begin
-                        // Show first mismatched result
-                        $display("FAIL: test %0d func %0d expected %0h, got %0h (result_count=%0d, result_valid=%0d)",
-                            t, test_func_list[t], local_result_values[0],
-                            result_values[0].value, result_count, result_valid);
+                        // Show first mismatched result - show full 128-bit values for v128
+                        if (local_result_types[0] == 4) begin
+                            $display("FAIL: test %0d func %0d expected hi=%0h lo=%0h, got %0h (result_count=%0d, result_valid=%0d)",
+                                t, test_func_list[t], local_result_values_hi[0], local_result_values[0],
+                                result_values[0].value, result_count, result_valid);
+                        end else begin
+                            $display("FAIL: test %0d func %0d expected %0h, got %0h (result_count=%0d, result_valid=%0d)",
+                                t, test_func_list[t], local_result_values[0],
+                                result_values[0].value, result_count, result_valid);
+                        end
                     end
                 end
             end
@@ -1896,6 +2087,7 @@ module wasm_runner;
             // Use test arrays index 0 which is zero-initialized
             test_result_types[0][0] = is_i64 ? 1 : 0;
             test_result_values[0][0] = expected_value;
+            test_result_values_hi[0][0] = 0;
 
             // Run the test (using test arrays index 0 as scratch)
             // These are already zero-initialized
@@ -1905,9 +2097,11 @@ module wasm_runner;
                 0,  // num_args (single-test mode doesn't support arguments)
                 test_arg_types[0],
                 test_arg_values[0],
+                test_arg_values_hi[0],
                 expect_trap ? 0 : 1,  // num_results: 0 for trap, 1 for normal
                 test_result_types[0],
                 test_result_values[0],
+                test_result_values_hi[0],
                 test_passed
             );
 

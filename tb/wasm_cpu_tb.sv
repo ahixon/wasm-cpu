@@ -37,8 +37,9 @@ module wasm_cpu_tb;
 
     // Element table interface (not used in simple tests)
     logic elem_init_en = 0;
+    logic [1:0] elem_init_table_idx = 0;
     logic [15:0] elem_init_idx = 0;
-    logic [15:0] elem_init_func_idx = 0;
+    logic [31:0] elem_init_value = 0;
 
     // Global, local, memory interfaces (not used in simple tests)
     logic global_init_en = 0;
@@ -113,8 +114,9 @@ module wasm_cpu_tb;
         .type_init_param_types(type_init_param_types),
         .type_init_result_types(type_init_result_types),
         .elem_init_en(elem_init_en),
+        .elem_init_table_idx(elem_init_table_idx),
         .elem_init_idx(elem_init_idx),
-        .elem_init_func_idx(elem_init_func_idx),
+        .elem_init_value(elem_init_value),
         .global_init_en(global_init_en),
         .global_init_idx(global_init_idx),
         .global_init_data(global_init_data),

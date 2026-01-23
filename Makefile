@@ -22,6 +22,7 @@ RTL_FILES = \
 	$(RTL_DIR)/alu/wasm_alu_i64.sv \
 	$(RTL_DIR)/alu/wasm_fpu_f32.sv \
 	$(RTL_DIR)/alu/wasm_fpu_f64.sv \
+	$(RTL_DIR)/alu/wasm_alu_v128.sv \
 	$(RTL_DIR)/alu/wasm_conv.sv \
 	$(RTL_DIR)/memory/wasm_memory.sv \
 	$(RTL_DIR)/memory/wasm_locals.sv \
@@ -119,7 +120,7 @@ WASM_RUNNER_FILES = \
 WASM_RUNNER_EXE = $(BUILD_DIR)/Vwasm_runner
 
 $(WASM_RUNNER_EXE): $(WASM_RUNNER_FILES) | $(BUILD_DIR)
-	$(VERILATOR) --binary --timing -j 0 -Wall -Wno-fatal \
+	$(VERILATOR) --binary --timing -j 0 -Wall -Wno-fatal --autoflush \
 		--top-module wasm_runner \
 		--Mdir $(BUILD_DIR)/verilator_runner_obj \
 		-o $(abspath $(WASM_RUNNER_EXE)) \
