@@ -129,10 +129,30 @@ module wasm_runner;
     // CPU -> Memory interface (struct-based, names must match CPU ports for .* connection)
     mem_bus_req_t  mem_req_o;
     mem_bus_resp_t mem_resp_i;
-    mem_mgmt_req_t mem_mgmt_req_o;
+    mem_mgmt_req_t mem_mgmt_req_o;    // CPU output
+    mem_mgmt_req_t mem_mgmt_req_tb;   // Testbench management request
+    mem_mgmt_req_t mem_mgmt_req_mux;  // Muxed to memory module
     mem_mgmt_resp_t mem_mgmt_resp_i;
     mem_op_t       mem_op_o;
     trap_t         mem_trap_i;
+
+    // Connect testbench init signals to management struct
+    always_comb begin
+        mem_mgmt_req_tb.init_valid    = mem_init_en;
+        mem_mgmt_req_tb.init_pages    = mem_init_pages;
+        mem_mgmt_req_tb.init_max_pages = mem_init_max_pages;
+        mem_mgmt_req_tb.grow_valid    = 1'b0;  // TB doesn't request grows
+        mem_mgmt_req_tb.grow_pages    = 32'b0;
+    end
+
+    // Mux: testbench takes precedence during init, then CPU controls
+    always_comb begin
+        if (mem_init_en) begin
+            mem_mgmt_req_mux = mem_mgmt_req_tb;
+        end else begin
+            mem_mgmt_req_mux = mem_mgmt_req_o;
+        end
+    end
 
     wasm_cpu #(.CODE_SIZE(65536), .STACK_SIZE(1024), .MEM_PAGES(1024)) dut (.*);
 
@@ -144,7 +164,7 @@ module wasm_runner;
         .mem_req_i(mem_req_o),
         .mem_resp_o(mem_resp_i),
         .mem_op_i(mem_op_o),
-        .mem_mgmt_req_i(mem_mgmt_req_o),
+        .mem_mgmt_req_i(mem_mgmt_req_mux),
         .mem_mgmt_resp_o(mem_mgmt_resp_i),
         // Data segment initialization
         .data_wr_en(mem_data_wr_en),
@@ -657,11 +677,15 @@ module wasm_runner;
                 base_addr = data_segments[seg].offset;
             end
 
+            $display("DEBUG: Loading data segment %0d: offset=%0d, length=%0d, data_start=%0d, passive=%0d",
+                     seg, data_segments[seg].offset, data_segments[seg].length,
+                     data_segments[seg].data_start, data_segments[seg].is_passive);
             for (int i = 0; i < data_segments[seg].length; i++) begin
                 @(posedge clk);
                 mem_data_wr_en = 1;
                 mem_data_wr_addr = base_addr + i;
                 mem_data_wr_data = data_bytes[data_segments[seg].data_start + i];
+                $display("DEBUG:   Writing mem[%0d] = 0x%02x", base_addr + i, data_bytes[data_segments[seg].data_start + i]);
             end
         end
         @(posedge clk);
@@ -1452,6 +1476,7 @@ module wasm_runner;
                 default: local_init_wr_data.vtype = TYPE_I32;
             endcase
             local_init_wr_data.value = arg_values[a];
+            $display("DEBUG: Writing local[%0d] = 0x%016x, CPU state = %0d", a, arg_values[a], dbg_state);
         end
         @(posedge clk);
         local_init_wr_en = 0;
@@ -1751,9 +1776,27 @@ module wasm_runner;
         load_table_metadata();
         load_elements();
 
+        // Check if we need more memory for passive element segments (used by table.init)
+        // Element segments are stored at TB_ELEM_SEG_BASE = 0x10000 (page 1)
+        begin
+            logic has_passive_elem_seg;
+            has_passive_elem_seg = 0;
+            for (int s = 0; s < num_elem_segments && s < 16; s++) begin
+                if (elem_segments[s].is_passive) has_passive_elem_seg = 1;
+            end
+            if (has_passive_elem_seg && init_mem_pages < 2) begin
+                @(posedge clk);
+                mem_init_en = 1;
+                mem_init_pages = 2;  // Allocate 2 pages (128KB) for element segment storage
+                init_mem_pages = 2;  // Update local tracking variable
+                mem_init_max_pages = (init_mem_max_pages < 2) ? 2 : init_mem_max_pages;
+                @(posedge clk);
+                mem_init_en = 0;
+                $display("NOTE: Allocated 2 memory pages for passive element segment storage");
+            end
+        end
+
         // Load element segment data and metadata for table.init/elem.drop
-        // Element segments are stored at 0x10000+ (requires 2+ pages)
-        // Only load if we have enough memory to avoid breaking tests
         if (num_elem_segments > 0 && init_mem_pages >= 2) begin
             load_elem_segments();
             load_elem_seg_metadata();

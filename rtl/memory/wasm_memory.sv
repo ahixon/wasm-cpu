@@ -192,6 +192,11 @@ module wasm_memory
                     end else begin
                         mem_resp_o.rdata = {56'b0, mem[mem_req_i.addr]};
                         mem_resp_o.rvalid = 1'b1;
+                        // DEBUG
+                        // synthesis translate_off
+                        $display("DEBUG MEM: load8_u addr=0x%08x value=0x%02x (mem[0]=0x%02x mem[1]=0x%02x mem[2]=0x%02x mem[3]=0x%02x)",
+                                 mem_req_i.addr, mem[mem_req_i.addr], mem[0], mem[1], mem[2], mem[3]);
+                        // synthesis translate_on
                     end
                 end
 
